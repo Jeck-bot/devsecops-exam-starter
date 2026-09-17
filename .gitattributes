@@ -1,0 +1,43 @@
+# Line-ending policy.
+#
+# Why this file exists: this repo is developed on Windows, where git is commonly
+# configured with `core.autocrlf=true`. That rewrites LF to CRLF on checkout -
+# and a shell script with CRLF line endings fails in ways that read as nonsense,
+# because the trailing \r becomes part of each command:
+#
+#     scripts/verify.sh: line 2: $'\r': command not found
+#
+# The same applies to anything executed inside a Linux container. The Dockerfile,
+# the workflow YAML, and the ignore files are all read by Linux tooling that does
+# not expect CRLF.
+#
+# `text=auto eol=lf` normalises to LF in the repository AND in the working tree,
+# so the files are byte-identical on every machine regardless of each developer's
+# autocrlf setting. This is the kind of bug that only appears on someone else's
+# clone, which makes it worth pinning rather than discovering.
+
+# Default: let git detect text files, and check them out with LF.
+* text=auto eol=lf
+
+# Explicit, because these are the ones that actually break:
+*.sh        text eol=lf
+Dockerfile  text eol=lf
+*.yml       text eol=lf
+*.yaml      text eol=lf
+.dockerignore text eol=lf
+.trivyignore  text eol=lf
+
+# The exception that proves the rule: cmd.exe is the one interpreter that wants
+# CRLF. The blanket `eol=lf` above would otherwise apply to batch files too, and
+# an LF-only .cmd misbehaves around labels and goto - the same class of bug as a
+# CRLF .sh, just pointing the other way.
+*.cmd       text eol=crlf
+*.bat       text eol=crlf
+
+# Binary - never touch these.
+*.png       binary
+*.jpg       binary
+*.jpeg      binary
+*.gif       binary
+*.pdf       binary
+*.ico       binary
