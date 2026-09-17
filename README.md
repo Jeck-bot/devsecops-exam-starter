@@ -7,6 +7,27 @@ LSCS DevSecOps Engineering Challenge — 41st LSCS, Term 1.
 A baseline Express API (`/health`, one Jest test) wrapped in a containerised, automated, security-gated
 delivery pipeline. The application code is unchanged; **the pipeline is the deliverable.**
 
+### Where the required answers live
+
+| Spec requirement | Answered in |
+|---|---|
+| Setup instructions — build and run the container locally | [Setup instructions](#setup-instructions) |
+| Why this base image, and not `node:latest` | [Why `node:24-alpine`](#why-node24-alpine) |
+| Which security scanner, and why that one | [Security integration](#security-integration) |
+| Vulnerability demonstration — the pipeline catching a planted flaw | [Vulnerability demonstration](#vulnerability-demonstration) |
+| Challenges faced | [Challenges faced](#challenges-faced) |
+
+**Contents:** [Pipeline at a glance](#pipeline-at-a-glance) · [Setup](#setup-instructions) ·
+[Architecture](#architectural-explanation) · [CI/CD](#cicd-pipeline) ·
+[Security](#security-integration) · [Vulnerability demo](#vulnerability-demonstration) ·
+[What this does *not* cover](#api-security-what-this-pipeline-does-not-cover) ·
+[Bonus features](#bonus-features) · [Challenges](#challenges-faced) ·
+[Checklist](#submission-checklist)
+
+> Sections marked **▸** are collapsible. The argument is always in the open text; the folded blocks
+> hold the supporting evidence — measurements, log output, regexes, and the options that were
+> considered and rejected. Nothing is hidden because it's weak.
+
 ---
 
 ## Pipeline at a glance
@@ -36,6 +57,17 @@ distinct problem at once rather than revealing them one push at a time.
 ---
 
 ## Setup instructions
+
+**Quickest path** — `make help` lists every entry point:
+
+```bash
+make up                                  # app + Redis, built and running
+curl http://127.0.0.1:3000/health
+make down
+```
+
+The `Makefile` is a thin convenience layer; every target wraps one of the commands below, so nothing
+is hidden behind it and nothing breaks if you don't have `make`.
 
 ### Run with Docker
 
@@ -95,7 +127,25 @@ on exactly the days you need it most.
 images on different days, and it will silently carry you across a major version bump the moment one is
 released. Reproducible builds require a pinned tag.
 
-**Why not `node:18-alpine`** (the example in the spec)? Because it is end-of-life:
+**Why not `node:18-alpine`** (the example in the spec)? Because Node 18 reached end of life on
+2025-04-30, and an EOL runtime receives **no security patches at all**. Pinning to it means every future
+CVE in the Node runtime is permanently unfixed — which would quietly undermine the entire point of
+bolting a vulnerability scanner on downstream. Node 24 is the current Active LTS line and matches the
+local development runtime (v24.21.0), so "works on my machine" and "works in the image" mean the same
+thing.
+
+**Why Alpine over the Debian-based tags?** `node:24-alpine` is **235 MB** on disk against **~1.1 GB**
+for `node:24` — roughly 4.7× smaller. Size is the visible benefit; the security benefit is the real one.
+Alpine ships a fraction of the OS packages, and **a package that isn't installed cannot have a CVE.**
+Smaller base → smaller attack surface → a shorter Trivy report that people actually read.
+
+**Why the digest and not just the tag?** The argument against `node:latest` is an argument about
+mutability, and it applies to `node:24-alpine` too — just more slowly. That tag is re-pushed on every
+patch release, so `FROM node:24-alpine` still means "whatever that name points at today". A tag is a
+pointer; only a digest is an identity.
+
+<details>
+<summary><b>▸ The Node release schedule, the size numbers, and the musl trade-off</b></summary>
 
 | Release line | Status | End of life |
 |---|---|---|
@@ -108,21 +158,12 @@ released. Reproducible builds require a pinned tag.
 26 becomes Active LTS — so this table has a known expiry, which is the point of writing the dates down
 rather than the word "current".)*
 
-An EOL runtime receives **no security patches at all**. Pinning to Node 18 today means every future CVE
-in the Node runtime is permanently unfixed — which would quietly undermine the entire point of adding a
-vulnerability scanner downstream. Node 24 is the current Active LTS line and matches the local development
-runtime (v24.21.0), so "works on my machine" and "works in the image" mean the same thing.
-
-**Why Alpine over Debian-based tags?** Measured, not estimated:
+Base image sizes, measured rather than estimated:
 
 | Base image | Compressed (pull) | On disk |
 |---|---|---|
 | `node:24` (Debian) | 410 MB | ~1.1 GB |
 | `node:24-alpine` | **59 MB** | **235 MB** |
-
-Roughly a 4.7× reduction. Size is the visible benefit, but the security benefit is the real one: Alpine
-ships a fraction of the OS packages, and **a package that isn't installed cannot have a CVE.** Smaller
-base = smaller attack surface = a shorter Trivy report that people actually read.
 
 > Worth stating explicitly because the two numbers get conflated constantly: Docker Hub reports
 > *compressed* size, `docker images` reports *uncompressed on-disk* size. They differ by about 4×, so
@@ -134,17 +175,16 @@ here because the dependency tree is pure JavaScript (Express and its transitive 
 and the `test` build stage runs Jest *inside* Alpine, so any musl incompatibility fails the build rather
 than reaching production.
 
-**Why the digest, not just the tag?**
+**The digest in full:**
 
 ```dockerfile
 FROM node:24-alpine@sha256:50c8e8ca1d27439048670df5883f32d57cf81cff6233222c893fd0d9884cbd81 AS deps
 ```
 
-The argument against `node:latest` above is an argument about mutability — and it applies to
-`node:24-alpine` too, just more slowly. That tag is re-pushed on every patch release (it moved on
-2026-09-09), so `FROM node:24-alpine` is still "whatever that name points at today". A tag is a pointer;
-only a digest is an identity. Pinning the digest is what makes the build actually reproducible, and
-Dependabot's `docker` ecosystem bumps it weekly so pinning doesn't mean going stale.
+That tag moved on 2026-09-09 during this build. Pinning the digest is what makes the build actually
+reproducible, and Dependabot's `docker` ecosystem bumps it weekly so pinning doesn't mean going stale.
+
+</details>
 
 ### Why a multi-stage build?
 
@@ -171,7 +211,13 @@ Measured result (`docker images`, uncompressed):
 Everything jest and supertest drag in — **206 packages** — is absent from the shipped image. Each one
 would have been code an attacker could potentially reach.
 
-The layer breakdown of that 250 MB is the more interesting number:
+The pipeline **asserts** the split rather than trusting it: the `docker` job runs `ls /app/node_modules`
+inside the built image and fails if `jest` is present. Without that check, dropping `--omit=dev` from the
+`deps` stage would still build, still serve traffic, and still pass every other test — it would just
+quietly ship 206 extra packages.
+
+<details>
+<summary><b>▸ Where the 250 MB actually goes — the application is 0.01% of its own image</b></summary>
 
 | Layer | Size |
 |---|---|
@@ -181,14 +227,11 @@ The layer breakdown of that 250 MB is the more interesting number:
 | `rm` of the bundled package managers | 29 kB |
 | `server.js` + `package.json` | 25 kB |
 
-**The application is 0.01% of its own image.** That ratio is worth internalising: the base image *is* the
-attack surface, which is why the choice between Alpine and Debian — and what gets stripped out of the base
-below — matters more than anything done in the application layer above it.
+That ratio is worth internalising: the base image *is* the attack surface, which is why the choice
+between Alpine and Debian — and what gets stripped out of the base, below — matters more than anything
+done in the application layer above it.
 
-The pipeline **asserts** the split rather than trusting it: the `docker` job runs `ls /app/node_modules`
-inside the built image and fails if `jest` is present. Without that check, dropping `--omit=dev` from the
-`deps` stage would still build, still serve traffic, and still pass every other test — it would just
-quietly ship 250 extra packages.
+</details>
 
 ### Why the runtime stage patches and strips its own base image
 
@@ -197,44 +240,61 @@ application dependency, `npm audit` green, the Trivy filesystem scan reporting `
 the image gate still red. Both findings came from the base image, and neither was fixable from anything in
 this repository.
 
-**1. `rm -rf` the bundled package managers.** Trivy reported four fixable HIGH findings — `brace-expansion`
-(CVE-2026-14257, CVE-2026-69152), `ip-address` (CVE-2026-69192, an SSRF), and `tar` (CVE-2026-73566). None
-appear in `package-lock.json`. All four live in **npm's own vendored dependency tree** at
-`/usr/local/lib/node_modules/npm/node_modules/`, shipped inside the official Node image.
-
-A container whose only job is `node server.js` needs no package manager at runtime, so npm, npx, yarn and
-corepack are deleted. That removes the entire `node-pkg` class of findings legitimately rather than by
-suppression — and it removes a ready-made install tool from an attacker who gains code execution. It is
-the same argument as Alpine-over-Debian, one level down: *the most reliable way not to have a
+**1. `rm -rf` the bundled package managers.** Trivy counted HIGH findings that appear nowhere in
+`package-lock.json` — they live in **npm's own vendored dependency tree**, shipped inside the official
+Node image. A container whose only job is `node server.js` needs no package manager at runtime, so npm,
+npx, yarn and corepack are deleted. That removes the entire `node-pkg` class of findings legitimately
+rather than by suppression, and takes a ready-made install tool away from an attacker who gains code
+execution. Same argument as Alpine-over-Debian, one level down: *the most reliable way not to have a
 vulnerability is not to have the package.*
 
-> Worth being precise about what this does **not** do: the image doesn't get 18 MB smaller. Deleting in a
-> later layer cannot reclaim bytes from an earlier one — `rm` writes a whiteout, and the data stays in the
-> base layer. It's the same append-only property that makes `.dockerignore` necessary, seen from the other
+**2. `apk upgrade --no-cache` — where digest pinning bites back.** Pinning a digest freezes the OS
+packages at whatever state that digest was published in, so **a pinned image is also a
+pinned-and-vulnerable one** the moment a CVE lands upstream. Official images trail Alpine's security
+updates by days or weeks, and there is no version of "wait for a new base image" that beats patching at
+build time. Measured on this exact digest: the base carries **2 fixable HIGH**, the shipped image
+carries **0**.
+
+Nothing is in `.trivyignore`. Both problems were fixed, not silenced.
+
+<details>
+<summary><b>▸ The measurements, and what stripping npm does <i>not</i> buy you</b></summary>
+
+The npm findings at the time of writing were `brace-expansion` (CVE-2026-14257, CVE-2026-69152),
+`ip-address` (CVE-2026-69192, an SSRF) and `tar` (CVE-2026-73566), all under
+`/usr/local/lib/node_modules/npm/node_modules/`. Re-scanned later those came back clean — advisory
+databases move, so that count is a dated observation, not a constant. The argument doesn't depend on it:
+shipping someone else's dependency tree means inheriting its findings on their schedule.
+
+> Worth being precise about what the `rm` does **not** do: the image doesn't get 18 MB smaller. Deleting
+> in a later layer cannot reclaim bytes from an earlier one — `rm` writes a whiteout, and the data stays
+> in the base layer. Same append-only property that makes `.dockerignore` necessary, seen from the other
 > side. The files are gone from the final filesystem (so Trivy no longer finds them) but not from the
 > image's history.
 
-**2. `apk upgrade --no-cache`, which is where digest pinning bites back.** With npm gone, two HIGH findings
-remained: `libcrypto3` and `libssl3` at `3.5.7-r0`, affected by CVE-2026-14456, fixed upstream in
-`3.5.8-r0`.
-
-This is the direct cost of the digest pin argued for above. Pinning a digest freezes the OS packages at
-whatever state that digest was published in, so **a pinned image is also a pinned-and-vulnerable one** the
-moment a CVE lands upstream. Official images trail Alpine's security updates by days or weeks, and there
-is no version of "wait for a new base image" that is faster than patching at build time.
-
-The honest trade-off: `apk` is a moving target, so this reduces byte-for-byte reproducibility of the final
-image. That's the correct trade. The digest still pins the base layer, the Node version and the filesystem
-layout; this line adds "…and current security patches on top". Reproducibility exists to make builds
-trustworthy, not to preserve known-vulnerable libraries.
-
-**Result — the image gate now passes on merit:**
+The OpenSSL finding, which *does* still reproduce:
 
 ```
-macky-merch-api:local (alpine 3.24.1)   alpine   0 vulnerabilities
+# the pinned base digest
+trivy image --severity HIGH,CRITICAL --ignore-unfixed node:24-alpine@sha256:50c8e8...
+  Total: 2 (HIGH: 2)
+  libcrypto3  CVE-2026-14456  3.5.7-r0 -> fixed in 3.5.8-r0
+  libssl3     CVE-2026-14456  3.5.7-r0 -> fixed in 3.5.8-r0
+
+# the image we ship
+trivy image --severity HIGH,CRITICAL --ignore-unfixed macky-merch-api:local
+  Total: 0        (libssl3-3.5.8-r0)
 ```
 
-Nothing is in `.trivyignore`. Both problems were fixed, not silenced.
+The honest trade-off: `apk` is a moving target, so this reduces byte-for-byte reproducibility of the
+final image. That's the correct trade. The digest still pins the base layer, the Node version and the
+filesystem layout; this line adds "…and current security patches on top". Reproducibility exists to make
+builds trustworthy, not to preserve known-vulnerable libraries.
+
+`scripts/verify.sh` step 12 runs that same scan locally, so the claim is re-checked on every run rather
+than trusted.
+
+</details>
 
 ### Why non-root, and why tini?
 
@@ -251,7 +311,17 @@ compromised, root inside the container is a far better launchpad for a kernel-ex
 unprivileged account. It also blocks the mundane failure modes: writing to `/etc`, installing packages,
 binding privileged ports.
 
-The pipeline **asserts** this rather than trusting it:
+The pipeline **asserts** this rather than trusting it — the `docker` job runs `id -u` inside the built
+image every commit and fails if it returns `0`.
+
+**tini** solves a separate problem. PID 1 is special: the kernel ignores signals that have no explicit
+handler installed. Node doesn't install a SIGTERM handler, so as PID 1 it ignores `docker stop`
+entirely — Docker waits the full 10-second grace period, then SIGKILLs, making every deploy slow. tini
+sits at PID 1, forwards signals, and reaps zombies, for about 1 MB. Measured: the container stops in
+**2 s** instead of 10.
+
+<details>
+<summary><b>▸ The assertion, and what tini does <i>not</i> buy</b></summary>
 
 ```yaml
 - name: Assert the container does not run as root
@@ -260,17 +330,13 @@ The pipeline **asserts** this rather than trusting it:
     if [ "$uid" = "0" ]; then exit 1; fi
 ```
 
-**tini** solves a separate problem. PID 1 is special: the kernel ignores signals that have no explicit
-handler installed. Node doesn't install a SIGTERM handler, so as PID 1 it ignores `docker stop` entirely —
-Docker waits the full 10-second grace period, then SIGKILLs, which makes every deploy slow. tini sits at
-PID 1, forwards signals, and reaps zombies, for about 1MB. `scripts/verify.sh` checks the container stops
-in under 5 seconds.
+**Stated precisely:** tini buys *prompt, signal-correct* shutdown — **not** connection draining.
+Draining in-flight requests requires `server.close()` inside `server.js`, and the starter repo forbids
+modifying it. Fast teardown is the part achievable from the container layer, and it's the part that
+makes `docker stop` honest; the rest is noted in
+[API security](#api-security-what-this-pipeline-does-not-cover) below.
 
-**Stated precisely:** this buys *prompt, signal-correct* shutdown — **not** connection draining. Draining
-in-flight requests requires `server.close()` inside `server.js`, and the starter repo forbids modifying
-it. Fast teardown is the part achievable from the container layer, and it's the part that makes
-`docker stop` honest; the rest is noted in [API security](#api-security-what-this-pipeline-does-not-cover)
-below.
+</details>
 
 ### Why `npm ci` and not `npm install`?
 
@@ -301,14 +367,13 @@ Three reasons it matters, in ascending order of importance:
    not remove it** — it stays readable via `docker history` and `docker save`. `.git` is the sharp edge
    here: it holds the full history, so a secret committed and later removed still ships inside the image.
 
-There's also a correctness angle on Windows: the host `node_modules` contains Windows-native binaries
-that cannot execute on Alpine. Excluding it forces `npm ci` to build a correct Linux tree.
+<details>
+<summary><b>▸ The entry that is deliberately <i>absent</i>, and why adding it breaks every build</b></summary>
 
-**What `.dockerignore` deliberately does *not* exclude — and why.** It's tempting to add `*.test.js`,
-since the runtime image obviously has no business carrying test code. That is a trap. `.dockerignore`
-filters the **build context**, which is shared by *every* stage — so excluding the spec files also hides
-them from the `test` stage, where Jest then finds nothing to run and exits 1 on `No tests found`. The
-result is a Dockerfile that fails to build on every single commit.
+It's tempting to add `*.test.js`, since the runtime image obviously has no business carrying test code.
+That is a trap. `.dockerignore` filters the **build context**, which is shared by *every* stage — so
+excluding the spec files also hides them from the `test` stage, where Jest then finds nothing to run and
+exits 1 on `No tests found`. The result is a Dockerfile that fails to build on every single commit.
 
 Test code is kept out of the shipped image by a stronger mechanism instead: the runtime stage copies an
 explicit **allow-list**, not everything-minus-a-deny-list.
@@ -319,8 +384,13 @@ COPY --chown=node:node package.json ./
 COPY --chown=node:node server.js ./
 ```
 
-Nothing leaks in by accident, because nothing gets in unless it's named. One build context, three stages,
-different needs — and the deny-list is the wrong tool for the only stage that matters.
+Nothing leaks in by accident, because nothing gets in unless it's named. One build context, three
+stages, different needs — and the deny-list is the wrong tool for the only stage that matters.
+
+There's also a correctness angle on Windows: the host `node_modules` contains Windows-native binaries
+that cannot execute on Alpine. Excluding it forces `npm ci` to build a correct Linux tree.
+
+</details>
 
 ---
 
@@ -418,7 +488,8 @@ a real gap, and it would be easy to ship only the first while believing you had 
 needs the parent commit to exist locally. With the default depth the scan errors out or silently degrades
 to a single commit.
 
-#### Why the nightly run scans `main` and not every ref
+<details>
+<summary><b>▸ Why the nightly run scans <code>main</code> and not every ref — a bug the harness found</b></summary>
 
 The bottom two rows say *"the full history of `main`"* rather than *"the entire history,"* and that
 distinction was not a design decision up front — it was a bug found by running the harness.
@@ -445,6 +516,8 @@ action: the action exposes no way to pass `--log-opts`. `scripts/verify.sh` step
 scoping, so the local harness and CI ask the identical question. A harness that is *stricter* than CI is
 worse than none — it fails on things CI would pass, and you learn to ignore it.
 
+</details>
+
 ### Why gate on HIGH/CRITICAL only, and `ignore-unfixed: true`?
 
 A gate that fires constantly gets disabled. Failing builds on LOW/MEDIUM findings — or on CVEs with no
@@ -468,25 +541,28 @@ and it's why the deliberate lodash vulnerability goes into `dependencies`, not `
 
 ### Why nightly
 
-Two things change while your source code doesn't:
+Two things change while your source code doesn't: **newly disclosed CVEs** (a dependency clean at merge
+time can be CRITICAL a week later with no commit in between — push-triggered scanning can only tell you
+about code you just wrote), and **git history** (the scheduled run is the only one that sees all of
+`main`'s history rather than just the triggering event's commits).
 
-1. **Newly disclosed CVEs.** Trivy's database updates continuously. A dependency that was clean at merge
-   time can be CRITICAL a week later with no commit in between. Push-triggered scanning can only ever tell
-   you about code you just wrote.
-2. **Git history.** As above — the scheduled run is the only one that sees all of `main`'s history,
-   rather than just the commits in the event that triggered it.
-
-### A note on `github-pat`
+<details>
+<summary><b>▸ A note on <code>github-pat</code> — a plausible-sounding justification that was wrong</b></summary>
 
 An earlier revision passed `github-pat: ${{ secrets.GITHUB_TOKEN }}` to the Trivy steps, believing it
 authenticated the vulnerability-DB pull from ghcr.io and avoided `TOOMANYREQUESTS`. It does not. Reading
-`trivy-action`'s `entrypoint.sh`, `INPUT_GITHUB_PAT` is only read inside `if [ "$TRIVY_FORMAT" = "github" ]`
-— it authenticates an *upload* to the Dependency Snapshot API, nothing else. The input was removed.
+`trivy-action`'s `entrypoint.sh`, `INPUT_GITHUB_PAT` is only read inside
+`if [ "$TRIVY_FORMAT" = "github" ]` — it authenticates an *upload* to the Dependency Snapshot API,
+nothing else. The input was removed.
 
 What actually mitigates the rate limit is already in place: the action restores the DB through
 `actions/cache` under a date-based key, so at most the first run of each day downloads anything, and the
-later passes reuse the binary via `skip-setup-trivy`. Recording this because a plausible-sounding, wrong
-justification in a config comment is worse than no comment — it stops anyone from checking.
+later passes reuse the binary via `skip-setup-trivy`.
+
+Recorded because a plausible-sounding, wrong justification in a config comment is worse than no comment —
+it stops anyone from checking.
+
+</details>
 
 ### Remediation, not just detection
 
@@ -525,16 +601,10 @@ PR: **[#1 — DEMO — DO NOT MERGE: deliberately vulnerable lodash@4.17.20](htt
 | Fixed in | `4.17.21` |
 
 The "fixed in" row is load-bearing. Because the gate runs with `ignore-unfixed: true`, a CVE with no
-available patch would be filtered out and the demo would silently pass. 4.17.20 has a fix exactly one
-patch release away, so it survives the filter. **A vulnerable package is not sufficient — it has to be a
-fixable one**, which is a subtlety worth internalising before trusting any scanner's output.
-
-Verified against the live advisory database rather than assumed: `npm audit --audit-level=high` on this
-tree exits **1**, reporting `lodash <=4.17.23  Severity: high` across several advisories with a fix
-available at `4.18.1`.
-
-It also went into `dependencies` rather than `devDependencies`, so it survives the `--omit=dev` gate,
-reaches the production image, and gets caught a second time by the image scan.
+available patch would be filtered out and the demo would silently pass. **A vulnerable package is not
+sufficient — it has to be a fixable one.** It also went into `dependencies` rather than
+`devDependencies`, so it survives the `--omit=dev` gate, reaches the production image, and gets caught a
+second time by the image scan.
 
 **Result — three independent failures:**
 
@@ -552,7 +622,14 @@ reaches the production image, and gets caught a second time by the image scan.
 That split matters as much as the failures do. A dependency CVE *should not* break the unit tests or
 trip the secret scanner — if it did, the gates would be measuring something other than what they claim.
 
-Verbatim from the `Trivy - FAIL on HIGH/CRITICAL` step of [run 35212574910](https://github.com/Jeck-bot/devsecops-exam-starter/actions/runs/35212574910):
+Two scanners reading two different databases both flagged it, and Trivy additionally found
+**`CVE-2026-4800`** — a second advisory the demo was not designed around. The scanner found more than the
+author knew about, which is the entire argument for running one.
+
+<details>
+<summary><b>▸ The CI logs, verbatim — Trivy's table and <code>npm audit</code> agreeing independently</b></summary>
+
+From the `Trivy - FAIL on HIGH/CRITICAL` step of [run 35212574910](https://github.com/Jeck-bot/devsecops-exam-starter/actions/runs/35212574910):
 
 ```
 package-lock.json (npm)
@@ -573,8 +650,6 @@ Total: 2 (HIGH: 2, CRITICAL: 0)
 ##[error]Process completed with exit code 1.
 ```
 
-![Trivy CVE detail](docs/img/trivy-cve-detail.png)
-
 And from `npm audit - production dependencies (gate)` in the same job — a second database, reached
 independently, agreeing:
 
@@ -592,9 +667,9 @@ Will install lodash@4.18.1, which is outside the stated dependency range
 node_modules/lodash
 ```
 
-One planted flaw, caught by layers that share no code path — and note that Trivy reported a second CVE
-(`CVE-2026-4800`) that was not planned for. The demo was designed around CVE-2021-23337; the scanner
-found more than the author knew about, which is the entire argument for running one.
+</details>
+
+![Trivy CVE detail](docs/img/trivy-cve-detail.png)
 
 ### Demo B — leaked secret (`demo/leaked-secret`)
 
@@ -607,34 +682,13 @@ access to nothing.
 committed and the scanner would have had nothing to find. A planted secret that git silently refuses to
 track is the most embarrassing way for this demo to "pass".
 
-#### Why it is not an AWS key — and why that is the better demo
-
-The first version of this branch planted a realistic `AKIA…` access key, chosen with some care (that
-analysis is preserved below, because it was correct). **It could not be pushed at all** — see
-[The control outside the pipeline](#the-control-outside-the-pipeline). So the planted secret was rebuilt
-to target a real, deliberate gap between the two scanners now known to be watching:
-
-| Scanner | Matches | Runs |
-|---|---|---|
-| GitHub push protection | **provider** patterns only — `AKIA…`, `ghp_…`, `sk_live_…` | before the push lands |
-| Gitleaks | provider patterns **plus** `generic-api-key` | in CI, after |
-
-Push protection is narrow *by design*: a false positive blocks an engineer's push, so it only fires on
-formats it can recognise with high confidence. Gitleaks can afford to be broader, because the cost of a
-false positive is a red check rather than a blocked push. The planted token matches no vendor's format,
-so it pushes cleanly — and Gitleaks catches it anyway.
-
-It deliberately does **not** imitate a vendor prefix either. Faking a `sk_live_`-shaped string we don't
-use would be a worse demo *and* would risk tripping the very control being routed around, for nothing.
-
-Checked against the real scanner before being relied on, rather than assumed:
-
-| Check | Value |
-|---|---|
-| Rule | `generic-api-key` |
-| Shannon entropy | **4.66** (rule requires > 3.5) |
-| Vendor prefix | none |
-| Path allowlisted? | No |
+**Not an AWS key either**, and that turned out to be the more interesting half. The first version planted
+a realistic `AKIA…` key and **could not be pushed at all** — see
+[The control outside the pipeline](#the-control-outside-the-pipeline). So it was rebuilt to target a real
+gap: GitHub push protection matches **provider** patterns only (narrow by design — a false positive blocks
+an engineer's push), while Gitleaks also carries `generic-api-key`, which fires on any high-entropy value
+bound to a secret-shaped name. A token in no vendor's format pushes cleanly and Gitleaks catches it
+anyway. Verified before being relied on: `RuleID: generic-api-key`, entropy **4.66**.
 
 **Result — one job fails, and only one:**
 
@@ -651,7 +705,12 @@ Checked against the real scanner before being relied on, rather than assumed:
 `Dependency scan` passing is an assertion, not a formality: its gate step runs `scanners: vuln` only, so
 a secret surfacing there would mean that step is misconfigured.
 
-Verbatim from the `Secret scan (Gitleaks)` job of
+![Gitleaks detail](docs/img/gitleaks-detail.png)
+
+<details>
+<summary><b>▸ The Gitleaks finding, verbatim from CI</b></summary>
+
+From the `Secret scan (Gitleaks)` job of
 [run 35221770125](https://github.com/Jeck-bot/devsecops-exam-starter/actions/runs/35221770125):
 
 ```
@@ -671,10 +730,14 @@ Note `Secret: REDACTED` — `--redact` is on, so the pipeline proves the catch w
 credential into CI logs that are themselves world-readable on a public repo. A secret scanner that leaks
 the secret into its own output has not helped.
 
-![Gitleaks detail](docs/img/gitleaks-detail.png)
+It also deliberately does **not** imitate a vendor prefix. Faking a `sk_live_`-shaped string for a
+service we don't use would be a worse artefact *and* would risk tripping the very control being routed
+around, for nothing.
+
+</details>
 
 <details>
-<summary><b>Preserved: the AWS-key analysis from the first attempt</b> — the reasoning still stands, it just could not be pushed</summary>
+<summary><b>▸ Preserved: the AWS-key analysis from the first attempt</b> — the reasoning still stands, it just could not be pushed</summary>
 
 The original planted key avoided a trap that silently produces a false pass:
 
@@ -707,7 +770,38 @@ is the strongest possible confirmation that it was not a toy.
 
 This section exists because pushing Demo B **failed**, and the reason was more interesting than the demo.
 
-`git push` never reached CI. GitHub Push Protection rejected it outright:
+`git push` never reached CI. GitHub Push Protection rejected it server-side with `GH013`, naming both
+planted strings by file and line. Three things follow:
+
+**1. Detective and preventative controls sit at different points in time.** Everything in `ci.yml` runs
+*after* a push — it can only tell you a secret has already been published. Push protection runs *before*
+one and refuses the write.
+
+| Control | When | Can it stop the leak? |
+|---|---|---|
+| Push protection | before the object reaches the remote | **yes** |
+| `secret-scan` on push/PR | after | no — reports it |
+| nightly `secret-scan` | much later | no — reports it |
+
+This pipeline was designed as though it were the outermost layer. It is not, and this README described
+the repository's posture incompletely until being blocked proved otherwise.
+
+**2. It independently validates the planted key.** Demo B's original AWS key was chosen by reasoning
+about Gitleaks' regex. GitHub's scanner is a separate implementation by a different vendor and flagged
+the same string on sight — including the secret access key that Gitleaks only catches via its generic
+entropy rule. Two independent detectors agreeing beats the regex analysis alone.
+
+**3. You cannot simply turn it off** — the API call to disable it succeeds, reads back `disabled`, and
+the push is rejected anyway. On a public repo the provider-pattern rule is enforced at platform level.
+That is the correct design: a control an admin can quietly switch off for sixty seconds is barely a
+control.
+
+So the demo was **rebuilt rather than forced through** — around the provider/generic gap described in
+Demo B above. Nothing was disabled, nothing was bypassed, push protection is still `enabled`, and the
+pipeline's own secret gate is demonstrated failing a real PR.
+
+<details>
+<summary><b>▸ The rejection verbatim, and the disable attempt</b></summary>
 
 ```
 remote: error: GH013: Repository rule violations found for refs/heads/demo/leaked-secret.
@@ -731,67 +825,27 @@ remote:
 remote: ! [remote rejected] demo/leaked-secret -> demo/leaked-secret (push declined due to repository rule violations)
 ```
 
-Three things worth drawing out of that.
-
-**1. Detective and preventative controls sit at different points in time.** Everything in `ci.yml` runs
-*after* a push — it can only tell you a secret has already been published to a remote. Push protection
-runs *before* one, server-side, and refuses the write. Ordered by when they fire:
-
-| Control | When | Can it stop the leak? |
-|---|---|---|
-| Push protection | before the object reaches the remote | **yes** |
-| `secret-scan` on push/PR | after | no — reports it |
-| nightly `secret-scan` | much later | no — reports it |
-
-The pipeline was designed as if it were the outermost layer. It is not, and this README described the
-repository's security posture incompletely until this happened.
-
-**2. It independently validates the planted key.** The section above argues at length that
-`AKIAIOSFODNN7EXAMPLE` is allowlisted and proves nothing, and that a replacement has to match the
-scanner's *real, current* rule rather than a remembered one. That argument was checked against Gitleaks'
-regex. GitHub's secret scanner is a completely separate implementation by a different vendor, and it
-flagged the same string — including the secret access key on line 23, which Gitleaks catches only via its
-generic high-entropy rule. Two independent detectors agreeing is far stronger evidence than the regex
-analysis alone.
-
-**3. You cannot simply turn it off, and that surprised me.** The obvious escape hatch is to disable push
-protection for the repository, push, and re-enable it. That is one API call:
+The obvious escape hatch is to disable push protection, push, and re-enable. That is one API call:
 
 ```bash
 gh api -X PATCH repos/OWNER/REPO \
   -f 'security_and_analysis[secret_scanning_push_protection][status]=disabled'
 ```
 
-The call succeeds. Reading the setting back confirms `"secret_scanning_push_protection":
-{"status":"disabled"}`. **The push is still rejected**, with the identical `GH013`.
+The call succeeds. Reading the setting back confirms
+`"secret_scanning_push_protection":{"status":"disabled"}`. **The push is still rejected**, with the
+identical `GH013`. The toggle governs the repository's own configuration; it does not buy an opt-out
+from the platform-level rule.
 
-For a **public** repository, GitHub enforces push protection for high-confidence provider patterns — an
-`AKIA…` access key is about as high-confidence as they come — independently of the repository-level
-toggle. The toggle governs the repository's own configuration; it does not buy an opt-out from the
-platform-level rule.
+The remaining sanctioned route is the per-secret unblock URL in the rejection message, which requires a
+human to state a reason. That is the right escape hatch for a genuine false positive, but reaching for
+it here would have meant weakening a real control to stage a demonstration of a weaker one.
 
-That design is deliberate and, on reflection, correct. A control that any repository admin can silently
-switch off for sixty seconds is not much of a control. The one that survived an attempt to disable it is
-the one actually protecting the credential.
+> The lesson that generalises past this exam: **to test a detective control you often have to stand down
+> a preventative one — and the discipline is in how narrowly you do it, and whether you put it back.**
+> Here the answer was not to stand anything down at all.
 
-**4. So the demo was rebuilt rather than forced through.** The remaining sanctioned route is the
-per-secret unblock URL in the rejection message, which requires a human to state a reason. That is the
-right escape hatch for a genuine false positive, but reaching for it here would have meant weakening a
-real control to stage a demonstration of a weaker one.
-
-The better answer was to stop fighting the control and understand it. Push protection matches **provider**
-patterns; Gitleaks matches those *plus* `generic-api-key`, a high-entropy rule that fires on any
-secret-shaped assignment. Demo B now plants a token matching no vendor's format: it pushes cleanly,
-because there is nothing for push protection to recognise, and Gitleaks catches it regardless.
-
-Nothing was disabled, nothing was bypassed, push protection is still `enabled`, and the pipeline's own
-secret gate is demonstrated failing a real PR. The demo got *better* by being blocked — it now requires
-understanding where two scanners' coverage differs, instead of just planting a string and watching a
-light go red.
-
-> The general lesson is the one that generalises past this exam: **to test a detective control you often
-> have to stand down a preventative one, and the discipline is in how narrowly you do it and whether you
-> put it back.**
+</details>
 
 ### For contrast — `main` stays green
 
@@ -804,7 +858,7 @@ remove it — `git log -p` still shows it. That is exactly why `secret-scan` che
 `fetch-depth: 0`, and why the nightly full-history scan exists alongside the per-push one.
 
 It is also the reason the nightly scan is scoped to `main`'s ancestry rather than every ref
-([above](#why-the-nightly-run-scans-main-and-not-every-ref)). The key on `demo/leaked-secret` is
+(see [Security integration](#security-integration)). The key on `demo/leaked-secret` is
 permanent in exactly the sense this section describes — so an unscoped nightly scan would report it
 every night, forever, for a branch that is *supposed* to contain it. A finding that can never be
 actioned is not a finding; it is a broken alarm, and a broken alarm gets muted along with the real ones.
@@ -916,11 +970,60 @@ enabled — without that, repository admins silently bypass the rule and it prot
 
 ## Challenges faced
 
-The spec asks for **one** hurdle. Five are recorded below because they share a shape worth naming: in
-every case the pipeline was *green, or red, for a reason I had not understood* — and the failure mode
-that cost the most time was never a crash, it was a control that appeared to work and did not.
+The spec asks for **one** hurdle. Here it is — the one that changed how I think about where security
+controls live, rather than the one that took longest to debug.
 
-If you only read one, read **#5**.
+**The pipeline was not the outermost layer, and I only found out by being stopped.**
+
+Pushing the leaked-secret demo branch failed. Not a red check — the push itself was refused,
+server-side, before any workflow ran:
+
+```
+remote: error: GH013: Repository rule violations found for refs/heads/demo/leaked-secret.
+remote:     - Push cannot contain secrets
+remote:       —— Amazon AWS Access Key ID ——————————————————————————
+remote:            path: config/aws-credentials.sample.env:22
+```
+
+I had designed and reasoned about this repository as though `ci.yml` were the whole of its security. It
+isn't. Everything in the pipeline is **detective** and runs *after* a push — at which point the secret is
+already on a remote and, as the permanence note above says, is compromised whether or not you delete it.
+GitHub Push Protection is **preventative** and runs *before* the write lands. It is strictly the more
+valuable of the two, and I hadn't accounted for it anywhere.
+
+It also delivered a result I could not have got myself: an *independent* confirmation that the planted key
+is realistic. I had argued from Gitleaks' regex that the key would match and that AWS's documentation key
+would not. GitHub's scanner is a different implementation by a different vendor, and it flagged the same
+string — plus the secret access key on line 23, which Gitleaks only catches through a generic entropy rule.
+
+Resolving it taught me more than the demo did. My first instinct was to disable push protection, push, and
+re-enable — and the API accepted it. `gh api -X PATCH … push_protection][status]=disabled` returned
+success, and reading the setting back confirmed `disabled`. **The push was rejected anyway.** On a public
+repository GitHub enforces push protection for high-confidence provider patterns regardless of the
+repository toggle.
+
+I was mildly annoyed for about a minute and then realised it is the correct design. A control an admin can
+quietly switch off for sixty seconds is barely a control. The one that refused my attempt to disable it is
+the one genuinely protecting the credential.
+
+The fix was to stop trying to defeat it. Push protection matches **provider** patterns — formats it can
+recognise with high confidence, because a false positive blocks someone's push. Gitleaks matches those
+*plus* `generic-api-key`, which fires on any high-entropy value bound to a secret-shaped name. Demo B was
+rebuilt around that gap: a token in no vendor's format pushes cleanly and Gitleaks still catches it
+(verified `RuleID: generic-api-key`, entropy 4.66, before I relied on it).
+
+Nothing ended up disabled or bypassed. The demo is better for having been blocked — it now demonstrates
+that I know where two scanners' coverage differs, rather than that I can plant a string and watch a light
+go red.
+
+If I keep one thing from this build, it's the instinct I had to unlearn. My first move was to switch the
+blocking control off — and the *right* move turned out to be to understand precisely what it did and
+didn't cover, then work inside that. **When a security control blocks you, "how do I disable this" and
+"what exactly is this checking" lead to very different places.** The second question got me a better
+demo, and the repository is no weaker than before I started.
+
+<details>
+<summary><b>▸ Four more, kept because they were real</b> — a <code>.dockerignore</code> entry that made the pipeline unbuildable, two occasions where I had a scanner's scope wrong, hardening that silently killed a container, and a red gate with nothing in the repo to fix</summary>
 
 **1. A `.dockerignore` entry that made the whole pipeline unbuildable.**
 
@@ -1016,52 +1119,7 @@ A footnote that turned out to matter: re-scanning the base image months later, t
 databases move under you, so a measured number in a comment is a *dated observation*, not a constant. The
 figures above are dated rather than deleted for exactly that reason.
 
-**5. The pipeline was not the outermost layer, and I only found out by being stopped.**
-
-Pushing the leaked-secret demo branch failed. Not a red check — the push itself was refused,
-server-side, before any workflow ran:
-
-```
-remote: error: GH013: Repository rule violations found for refs/heads/demo/leaked-secret.
-remote:     - Push cannot contain secrets
-remote:       —— Amazon AWS Access Key ID ——————————————————————————
-remote:            path: config/aws-credentials.sample.env:22
-```
-
-I had designed and reasoned about this repository as though `ci.yml` were the whole of its security. It
-isn't. Everything in the pipeline is **detective** and runs *after* a push — at which point the secret is
-already on a remote and, as the permanence note above says, is compromised whether or not you delete it.
-GitHub Push Protection is **preventative** and runs *before* the write lands. It is strictly the more
-valuable of the two, and I hadn't accounted for it anywhere.
-
-It also delivered a result I could not have got myself: an *independent* confirmation that the planted key
-is realistic. I had argued from Gitleaks' regex that the key would match and that AWS's documentation key
-would not. GitHub's scanner is a different implementation by a different vendor, and it flagged the same
-string — plus the secret access key on line 23, which Gitleaks only catches through a generic entropy rule.
-
-Resolving it taught me more than the demo did. My first instinct was to disable push protection, push, and
-re-enable — and the API accepted it. `gh api -X PATCH … push_protection][status]=disabled` returned
-success, and reading the setting back confirmed `disabled`. **The push was rejected anyway.** On a public
-repository GitHub enforces push protection for high-confidence provider patterns regardless of the
-repository toggle.
-
-I was mildly annoyed for about a minute and then realised it is the correct design. A control an admin can
-quietly switch off for sixty seconds is barely a control. The one that refused my attempt to disable it is
-the one genuinely protecting the credential.
-
-The fix was to stop trying to defeat it. Push protection matches **provider** patterns — formats it can
-recognise with high confidence, because a false positive blocks someone's push. Gitleaks matches those
-*plus* `generic-api-key`, which fires on any high-entropy value bound to a secret-shaped name. Demo B was
-rebuilt around that gap: a token in no vendor's format pushes cleanly and Gitleaks still catches it
-(verified `RuleID: generic-api-key`, entropy 4.66, before I relied on it).
-
-Nothing ended up disabled or bypassed. The demo is better for having been blocked — it now demonstrates
-that I know where two scanners' coverage differs, rather than that I can plant a string and watch a light
-go red.
-
-If I keep one thing from this build, it's that: **to test a detective control you sometimes have to stand
-down a preventative one, and the entire discipline is in how narrowly you do it and whether you put it
-back.** I got the demo I wanted and the repository is no weaker than before it.
+</details>
 
 ---
 
