@@ -53,6 +53,7 @@ Dockerfile
 Dockerfile.*
 .dockerignore
 docker-compose*.yml
+Makefile
 scripts
 
 # ---- Docs -------------------------------------------------------------------
