@@ -10,7 +10,8 @@
   "author": "La Salle Computer Society",
   "license": "ISC",
   "dependencies": {
-    "express": "^4.22.3"
+    "express": "^4.22.3",
+    "lodash": "4.17.20"
   },
   "devDependencies": {
     "jest": "^29.5.0",
