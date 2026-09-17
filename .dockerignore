@@ -1,0 +1,91 @@
+# .dockerignore - controls what enters the BUILD CONTEXT.
+#
+# Docker does NOT read .gitignore. Without this file, `docker build` tars up the
+# entire directory (including node_modules and .git) and ships it to the daemon
+# before the first instruction even runs.
+#
+# Three reasons this matters:
+#   1. Speed      - a 200MB context is uploaded on every single build.
+#   2. Caching    - any change to any non-ignored file busts the COPY cache.
+#   3. SECURITY   - a `COPY . .` bakes whatever it finds into a layer. Deleting
+#                   it in a later layer does NOT remove it; it stays readable
+#                   via `docker history` / `docker save`.
+
+# ---- Version control --------------------------------------------------------
+# .git holds the FULL history. If a secret was ever committed and later removed,
+# it is still in here and would ship inside the image.
+.git
+.gitignore
+.gitattributes
+.github
+
+# ---- Dependencies -----------------------------------------------------------
+# Reinstalled inside the image by `npm ci`. Host node_modules is built for
+# Windows; copying it in would ship native binaries that cannot run on Alpine.
+node_modules
+npm-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# ---- Tests & coverage -------------------------------------------------------
+# Coverage output is generated, never an input to a build.
+coverage
+
+# NOTE: *.test.js / *.spec.js / jest.config.* are deliberately NOT listed here.
+#
+# It is tempting to exclude them - the runtime image has no business carrying
+# test code - but .dockerignore applies to the BUILD CONTEXT, which is shared by
+# every stage. The `test` stage does `COPY . .` and then `RUN npm test`, so
+# excluding the spec files here means Jest finds zero tests and exits 1:
+#
+#     No tests found, exiting with code 1
+#
+# ...which fails `docker build --target test` on every single commit.
+#
+# Test code is kept out of the SHIPPED image by a stronger mechanism: the
+# runtime stage copies an explicit allow-list (`package.json`, `server.js`)
+# rather than `COPY . .`. Nothing can leak in by accident, because nothing gets
+# in unless it is named. See the comment in Dockerfile's runtime stage.
+
+# ---- Docker & CI meta -------------------------------------------------------
+# Editing the Dockerfile should not invalidate the cached COPY of the source.
+Dockerfile
+Dockerfile.*
+.dockerignore
+docker-compose*.yml
+scripts
+
+# ---- Docs -------------------------------------------------------------------
+*.md
+docs
+LICENSE
+
+# ---- Secrets - must never enter the build context --------------------------
+.env
+.env.*
+*.pem
+*.key
+*.p12
+*.pfx
+config/*credentials*
+
+# ---- Editor / OS ------------------------------------------------------------
+.vscode
+.idea
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ---- Scanner output ---------------------------------------------------------
+*.sarif
+trivy-results.*
+gitleaks-report.json
+
+# -----------------------------------------------------------------------------
+# DELIBERATELY NOT IGNORED:
+#   package.json, package-lock.json  -> `npm ci` requires BOTH in the context.
+#   server.js                        -> the application itself.
+#   server.test.js                   -> the `test` stage runs it. It is excluded
+#                                       from the runtime image by explicit COPY,
+#                                       not by this file.
+# -----------------------------------------------------------------------------
