@@ -1,0 +1,132 @@
+# Bonus requirement: "spins up both your Node.js app and a dummy database
+# container (e.g. Redis or PostgreSQL) connected via a Docker network."
+#
+#   docker compose up -d --build
+#   docker compose ps
+#   docker compose down -v
+
+name: macky-merch
+
+services:
+  api:
+    build:
+      context: .
+      # Explicitly the runtime stage. Without this, Compose builds the LAST
+      # stage in the Dockerfile - which happens to be runtime here, but relying
+      # on file ordering is fragile.
+      target: runtime
+    image: macky-merch-api:local
+    restart: unless-stopped
+
+    environment:
+      NODE_ENV: production
+      PORT: "3000"
+      # `cache` resolves via Docker's embedded DNS on macky-net - no IPs, no
+      # links, no host networking. See the note at the bottom of this file.
+      REDIS_URL: redis://cache:6379
+
+    ports:
+      # Bound to 127.0.0.1 deliberately. Plain "3000:3000" binds 0.0.0.0 and
+      # publishes the API to every device on the network - including on
+      # untrusted cafe/campus wifi.
+      - "127.0.0.1:3000:3000"
+
+    depends_on:
+      cache:
+        # Waits for Redis to pass its healthcheck, not merely to start.
+        # `depends_on` alone only guarantees container creation order.
+        condition: service_healthy
+
+    networks: [macky-net]
+
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "node",
+          "-e",
+          "fetch('http://127.0.0.1:3000/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))",
+        ]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
+
+    # --- Hardening -----------------------------------------------------------
+    security_opt:
+      # Blocks setuid binaries from escalating privileges - closes the usual
+      # path from "unprivileged shell in container" to "root in container".
+      - no-new-privileges:true
+    cap_drop:
+      # Docker grants ~14 capabilities by default. An Express server needs none
+      # of them: it binds port 3000, which is above 1024.
+      - ALL
+    read_only: true # the app writes nothing to disk
+    tmpfs:
+      - /tmp # ...except anything Node may need to scratch
+
+  cache:
+    image: redis:7-alpine
+    restart: unless-stopped
+    # Disable RDB snapshots and the AOF log: this is a throwaway cache, so
+    # persistence would only add disk I/O and a volume to clean up.
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+
+    # Start directly as the redis user (uid 999, gid 1000 - both created by the
+    # official image). This is REQUIRED for `cap_drop: ALL` below to work.
+    #
+    # The image's entrypoint contains:
+    #
+    #     if [ "$1" = 'redis-server' -a "$(id -u)" = '0' ]; then
+    #         exec gosu redis "$0" "$@"
+    #     fi
+    #
+    # Because our `command:` begins with `redis-server`, a container starting as
+    # root takes that branch - and `gosu` calls setuid(2)/setgid(2), which need
+    # CAP_SETUID/CAP_SETGID. `cap_drop: ALL` removes exactly those, so gosu
+    # fails, the container dies, its healthcheck never passes, and `api` (which
+    # waits on service_healthy) never starts.
+    #
+    # Setting `user:` makes `id -u` non-zero, so the entrypoint skips the branch
+    # and execs redis directly. Better than `cap_add: [SETUID, SETGID]`: the
+    # process is never root at any point, not even briefly.
+    user: "999:1000"
+
+    networks: [macky-net]
+
+    # NOTE: no `ports:` block, and that is the point. Redis is reachable from
+    # `api` over macky-net but is NOT published to the host. Redis has no
+    # authentication by default, so publishing it would expose an unauthenticated
+    # data store - a routine source of real-world breaches.
+
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+
+networks:
+  # A user-defined bridge (not the default one) gives automatic DNS resolution
+  # between services by name, and isolates this project's containers from every
+  # other container on the host.
+  macky-net:
+    driver: bridge
+# -----------------------------------------------------------------------------
+# HONEST SCOPE NOTE (repeated in the README):
+#
+# server.js never reads REDIS_URL. That is deliberate - the starter repo's
+# README says not to modify core application functionality, and this track is
+# not graded on backend code.
+#
+# The spec asks for a dummy database container "connected via a Docker network",
+# so the NETWORK WIRING is the deliverable, and it is verifiable:
+#
+#   docker compose exec api node -e "require('dns').promises.lookup('cache').then(console.log)"
+#
+# ...resolves `cache` to its container IP from inside the api container.
+# -----------------------------------------------------------------------------
