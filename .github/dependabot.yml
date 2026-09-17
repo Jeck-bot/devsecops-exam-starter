@@ -1,0 +1,42 @@
+# Dependabot - the preventative half of dependency security.
+#
+# Trivy in ci.yml is DETECTIVE: it tells you a vulnerable package is already in
+# the tree. Dependabot is PREVENTATIVE: it opens the PR that removes it.
+# A scanner without a remediation path just produces a red build nobody can fix.
+
+version: 2
+
+updates:
+  # --- npm packages ---------------------------------------------------------
+  - package-ecosystem: npm
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    # Group patch/minor bumps into one PR so the queue stays reviewable;
+    # majors arrive separately because they can carry breaking changes.
+    groups:
+      minor-and-patch:
+        update-types: [minor, patch]
+    commit-message:
+      prefix: "chore(deps)"
+
+  # --- Base image in the Dockerfile ----------------------------------------
+  # Catches the case where node:24-alpine ships a patched OS package.
+  - package-ecosystem: docker
+    directory: "/"
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: "chore(docker)"
+
+  # --- The pipeline's own dependencies -------------------------------------
+  # Third-party Actions execute with access to the repo and its secrets, so
+  # they are a supply-chain surface in exactly the same way npm packages are.
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: "ci(deps)"

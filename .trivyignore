@@ -1,0 +1,37 @@
+# .trivyignore - suppressed vulnerability findings.
+#
+# INTENTIONALLY EMPTY.
+#
+# Every entry added here silences a real finding, so each one must carry:
+#
+#   1. The CVE ID.
+#   2. WHY it is not exploitable in this application specifically
+#      (not "it's only a dev dependency" - justify the actual attack path).
+#   3. A review date. Suppressions expire; they are not permanent decisions.
+#   4. Who approved it.
+#
+# Format:
+#
+#   # CVE-2024-XXXXX
+#   # Reason:   Vulnerable code path is in the CLI entrypoint, which this
+#   #           service never invokes. No fix available upstream as of 2026-09.
+#   # Review:   2026-12-01
+#   # Approved: @Jeck-bot
+#   CVE-2024-XXXXX
+#
+# Note that in THIS format, rules 3 and 4 are enforced by convention only -
+# nothing stops a suppression outliving its review date except someone noticing.
+# If entries ever accumulate here, migrate to `.trivyignore.yaml`, where Trivy
+# parses an `expired_at` field itself and the suppression stops applying on that
+# date whether or not anyone remembered:
+#
+#   vulnerabilities:
+#     - id: CVE-2024-XXXXX
+#       statement: Vulnerable code path is never invoked by this service.
+#       expired_at: 2026-12-01
+#
+# A policy the tool enforces beats a policy written in a comment.
+#
+# An empty ignore file is the goal state. If this file starts growing, that is
+# a signal that the severity threshold in ci.yml is mistuned - fix the
+# threshold, don't paper over findings one by one.

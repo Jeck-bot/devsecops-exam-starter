@@ -1,0 +1,496 @@
+# Secure Delivery Pipeline - Macky Merch API
+#
+# Job graph (jobs without `needs` start in parallel):
+#
+#   push / pull_request -> main, plus a nightly schedule
+#            |
+#   +--------+-------------+------------------+-----------------+
+#   v        v             v                  v                 |
+#  test   secret-scan  dependency-scan      codeql              |
+#  (22,24) Gitleaks    Trivy fs + npm audit  JS static analysis |
+#   |                                                           |
+#   +---------------> docker <----------------------------------+
+#                     build --target test
+#                     build runtime
+#                     assert non-root
+#                     smoke-test /health
+#                     Trivy image scan
+#
+# Only `docker` has a dependency (`needs: [test]`). The scanners are independent
+# of it and of each other, so a broken pipeline reports every distinct problem in
+# one run rather than revealing them one push at a time.
+#
+# ---------------------------------------------------------------------------
+# A note on the SHA pins below.
+#
+# Every third-party action is pinned to a full commit SHA, with the human-
+# readable tag in a trailing comment. Tags are MUTABLE: `@v7` is a pointer the
+# upstream owner can move at any time, so a compromised (or merely careless)
+# maintainer can change what runs in this pipeline without anything in this file
+# changing. A SHA is immutable - it is the artifact, not a name for it.
+#
+# This is the control that actually backs up the `permissions:` block below:
+# least privilege limits what a compromised action can DO, SHA pinning limits
+# what can BECOME a compromised action. Dependabot (`github-actions` ecosystem)
+# bumps these weekly, so pinning does not mean going stale. trivy-action itself
+# pins its own internal dependency this way, for the same reason.
+# ---------------------------------------------------------------------------
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch: # lets you re-run the pipeline by hand from the Actions tab
+  schedule:
+    # 02:00 UTC daily. A scheduled run is not redundant with push runs - it is
+    # the only way to catch the two things that change while your code does not:
+    #
+    #   1. Newly disclosed CVEs. Trivy's DB updates continuously; a dependency
+    #      that was clean at merge time can be CRITICAL a week later with no
+    #      commit in between. Push-triggered scanning alone can only ever tell
+    #      you about code you just wrote.
+    #   2. Full git history. On push/pull_request, gitleaks scans only the
+    #      commits in that event (see the secret-scan job). On `schedule` and
+    #      `workflow_dispatch` it scans the full history of this ref - so this
+    #      is the run that would surface a secret committed long ago and since
+    #      deleted, which the per-commit runs structurally cannot see.
+    - cron: "0 2 * * *"
+
+# Least privilege by default. The GITHUB_TOKEN starts read-only and individual
+# jobs opt into more. If the workflow is ever compromised, the blast radius is
+# bounded by this line.
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  # Cancel superseded runs for PULL REQUESTS only. A new push to a PR branch
+  # makes the in-flight run obsolete, so cancelling it saves minutes and gets
+  # feedback on the latest commit sooner.
+  #
+  # Runs on `main` and scheduled runs are deliberately NOT cancelled. Branch
+  # protection reads the status of main's head commit; a cancelled run leaves it
+  # neither green nor red, which both blocks merges and destroys the "main is
+  # green" evidence this pipeline exists to produce.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  IMAGE_NAME: macky-merch-api
+
+jobs:
+  # ===========================================================================
+  # 1. TESTS - spec requirement: "Install dependencies" + "Run automated tests"
+  # ===========================================================================
+  test:
+    name: Unit tests (Node ${{ matrix.node }})
+    runs-on: ubuntu-latest
+    # Without a timeout a hung job runs until GitHub's 6-hour ceiling, burning
+    # runner minutes and holding the concurrency group open. This suite takes
+    # well under a minute.
+    timeout-minutes: 10
+
+    strategy:
+      # Don't cancel Node 22 just because Node 24 failed - we want to know
+      # whether a failure is version-specific or universal.
+      fail-fast: false
+      matrix:
+        node: ["22", "24"]
+
+    steps:
+      - name: Check out the code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          # checkout writes the job's token into .git/config by default, where
+          # it stays readable by every later step and any process they spawn.
+          # Nothing in this pipeline pushes, so there is no reason to keep it.
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm # caches ~/.npm, keyed on package-lock.json
+
+      # `npm ci`, the deterministic form of `npm install`:
+      #   - installs strictly from package-lock.json (ignores semver ranges)
+      #   - wipes node_modules first, so no stale state leaks between runs
+      #   - FAILS if package.json and the lockfile disagree
+      # A dependency can therefore never silently change between the run that
+      # went green and the run that ships.
+      - name: Install dependencies (npm ci)
+        run: npm ci
+
+      - name: Run tests
+        run: npm test -- --ci
+
+  # ===========================================================================
+  # 2. SECRET SCAN - catches committed credentials
+  # ===========================================================================
+  secret-scan:
+    name: Secret scan (Gitleaks)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Check out the code (full history)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          # Required. checkout defaults to a shallow clone (fetch-depth: 1).
+          #
+          # On push/pull_request, gitleaks-action scans a COMMIT RANGE, not the
+          # working tree - it passes
+          #     --log-opts=--no-merges --first-parent <base>^..<head>
+          # to gitleaks. Resolving `<base>^` needs the parent commit to exist
+          # locally, which a depth-1 clone does not have. Without this line the
+          # scan errors out or silently degrades to a single commit.
+          fetch-depth: 0
+          persist-credentials: false
+
+      # SCOPE, stated precisely, because it is easy to get wrong - and because
+      # getting it wrong is silent in both directions.
+      #
+      #   push / pull_request -> only the commits in that event
+      #   schedule / dispatch -> the full history of THIS REF (see below)
+      #
+      # The two halves answer different questions and you need both. The
+      # per-commit run catches a secret as it is introduced, which is what
+      # blocks the demo/leaked-secret PR. The nightly run catches "a credential
+      # committed and deleted months ago, still recoverable by anyone who clones
+      # this repo" - deleting the file in a later commit does not remove it.
+      #
+      # --- Per-commit: the action, unchanged ---------------------------------
+      #
+      # gitleaks-action is configured ENTIRELY through env vars - its action.yml
+      # declares no `inputs:` at all, so a `with:` block here would be silently
+      # ignored.
+      # Free for personal accounts; organisation accounts need GITLEAKS_LICENSE.
+      - name: Run Gitleaks (commit range)
+        if: github.event_name == 'push' || github.event_name == 'pull_request'
+        uses: gitleaks/gitleaks-action@e0c47f4f8be36e29cdc102c57e68cb5cbf0e8d1e # v3
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # --- Nightly: scoped to this ref's ancestry ----------------------------
+      #
+      # This runs gitleaks directly rather than through the action, for one
+      # reason: `gitleaks detect` defaults to scanning EVERY REF in the
+      # repository, not the checked-out branch. Combined with `fetch-depth: 0`
+      # above - which fetches all branches as refs/remotes/origin/* - that means
+      # a nightly run sitting on a clean `main` also walks demo/leaked-secret
+      # and fails on the fake key planted there deliberately.
+      #
+      # Measured, rather than assumed: in a clone with main checked out and
+      # demo/leaked-secret present only as a remote-tracking ref, gitleaks
+      # scanned 4 commits and reported 2 leaks. main itself has 3 commits and
+      # is clean. The run goes red and nothing in the working tree explains why.
+      #
+      # `--log-opts=HEAD` scopes the walk to this ref's ancestry, which is the
+      # question actually worth asking nightly: "is there a secret in the
+      # history of the branch we ship?" A secret that ever landed on main is
+      # still caught, because it is an ancestor of main. The demo branches are
+      # never merged, so they are not - and they are known planted secrets whose
+      # whole job is to fail their own PR, which they still do, above.
+      #
+      # Digest-pinned for the same reason every action above is: a tag is a
+      # pointer someone else can move, a digest is the artifact itself.
+      - name: Run Gitleaks (full history of this ref)
+        if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+        run: |
+          docker run --rm -v "$PWD:/repo" \
+            zricethezav/gitleaks@sha256:c00b6bd0aeb3071cbcb79009cb16a60dd9e0a7c60e2be9ab65d25e6bc8abbb7f \
+            detect --source /repo --redact -v --log-opts=HEAD
+
+  # ===========================================================================
+  # 3. DEPENDENCY SCAN - spec requirement: "scan for vulnerable npm packages"
+  # ===========================================================================
+  dependency-scan:
+    name: Dependency scan (Trivy + npm audit)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    permissions:
+      contents: read
+      security-events: write # required to publish SARIF to the Security tab
+
+    steps:
+      - name: Check out the code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: "24"
+          cache: npm
+
+      - name: Install dependencies (npm ci)
+        run: npm ci
+
+      # --- Pass 1: REPORT ----------------------------------------------------
+      # Always prints a readable table, never fails. Visibility and gating are
+      # deliberately separate concerns: engineers should be able to see the
+      # current state even on a green build.
+      #
+      # On the ghcr.io rate limit: Trivy downloads its vulnerability DB from
+      # ghcr.io, and anonymous pulls from shared CI egress IPs can hit
+      # TOOMANYREQUESTS. There is no `github-pat` input for this - despite the
+      # name, that input is only read when `format: github` (it authenticates an
+      # upload to the Dependency Snapshot API, not the DB download). What
+      # actually mitigates it is the action's built-in DB cache: it restores
+      # <cache-dir> via actions/cache under a date-based key, so at most the
+      # first run of each day performs a download at all, and the two later
+      # passes below reuse it via `skip-setup-trivy`.
+      - name: Trivy - filesystem report
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          scanners: vuln,secret,misconfig
+          severity: HIGH,CRITICAL
+          format: table
+          exit-code: "0"
+          # Trivy's own DB cache defaults to <workspace>/.cache/trivy, i.e.
+          # INSIDE the directory being scanned. Without this the scanner walks
+          # its own vulnerability database on every pass.
+          skip-dirs: .cache
+
+      # --- Pass 2: SARIF for the Security tab --------------------------------
+      - name: Trivy - SARIF output
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          scanners: vuln,secret,misconfig
+          severity: HIGH,CRITICAL
+          # Without this, SARIF output IGNORES the `severity` filter above and
+          # uploads every LOW/MEDIUM finding, drowning the Security tab.
+          limit-severities-for-sarif: true
+          format: sarif
+          output: trivy-fs.sarif
+          exit-code: "0"
+          skip-dirs: .cache
+          skip-setup-trivy: true # reuse the binary installed in pass 1
+
+      - name: Upload SARIF to the Security tab
+        uses: github/codeql-action/upload-sarif@b96794f015dfd88f77b49b1c93e0fa7110f94c63 # v4
+        if: always()
+        # Code scanning uploads require a PUBLIC repo (or GitHub Advanced
+        # Security). On a private repo this step 403s - which should degrade
+        # the Security tab, not fail the pipeline.
+        continue-on-error: true
+        with:
+          sarif_file: trivy-fs.sarif
+          category: trivy-fs
+
+      # --- Pass 3: THE GATE --------------------------------------------------
+      # exit-code 1 => step fails => job fails => PR is blocked by branch
+      # protection. This is the step the deliberate lodash CVE trips.
+      - name: Trivy - FAIL on HIGH/CRITICAL
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          scanners: vuln
+          severity: HIGH,CRITICAL
+          # Only flag what can actually be acted on. A CVE with no patch
+          # available is not a task, it's noise - and gating on it just trains
+          # people to add blanket ignores.
+          ignore-unfixed: true
+          exit-code: "1"
+          skip-dirs: .cache
+          skip-setup-trivy: true
+
+      # An independent second opinion from a different vulnerability database.
+      # Trivy and npm audit do not always agree; disagreement is itself signal.
+      #
+      # Split into report and gate for the same reason Trivy is:
+      - name: npm audit - full tree (report)
+        if: always()
+        # devDependencies included. Never fails the build: jest and supertest
+        # drag in a large transitive tree that never leaves the CI runner, so a
+        # finding here is worth SEEING but is not worth blocking a release over.
+        run: npm audit --audit-level=high || true
+
+      - name: npm audit - production dependencies (gate)
+        # Gate on what actually ships. `--omit=dev` is the npm-side equivalent
+        # of the Dockerfile's `deps` stage, so this asks exactly one question:
+        # "is there a fixable HIGH in code that reaches production?"
+        #
+        # The deliberate lodash vulnerability is installed into `dependencies`,
+        # not `devDependencies`, precisely so it still trips this gate.
+        run: npm audit --omit=dev --audit-level=high
+
+  # ===========================================================================
+  # 4. CODEQL - the spec's third scanner option: "CodeQL / Static Analysis"
+  #
+  # Trivy and Gitleaks both ask "is there a known-bad KNOWN THING here?" - a
+  # package with a CVE, a string matching a credential pattern. Both work from a
+  # list. CodeQL asks a different question: it builds a dataflow graph of the
+  # source and looks for untrusted input reaching a dangerous sink. That catches
+  # a bug nobody has catalogued yet, which a signature scanner structurally
+  # cannot do. Three tools, three distinct failure modes covered.
+  #
+  # NOTE: like the SARIF upload above, code scanning requires a PUBLIC repo (or
+  # GitHub Advanced Security). Keep the fork public.
+  # ===========================================================================
+  codeql:
+    name: Static analysis (CodeQL)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    permissions:
+      contents: read
+      security-events: write # to publish results to the Security tab
+      actions: read
+
+    steps:
+      - name: Check out the code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Initialise CodeQL
+        uses: github/codeql-action/init@b96794f015dfd88f77b49b1c93e0fa7110f94c63 # v4
+        with:
+          languages: javascript-typescript
+          # `security-extended` runs the standard suite plus lower-precision
+          # queries. Justified here because the codebase is ~20 lines: the usual
+          # argument against it is false-positive volume, and there is no volume.
+          queries: security-extended
+
+      # JavaScript is a "no-build" language for CodeQL - the extractor reads the
+      # source directly, so there is no build step between init and analyze.
+      - name: Perform CodeQL analysis
+        uses: github/codeql-action/analyze@b96794f015dfd88f77b49b1c93e0fa7110f94c63 # v4
+        with:
+          category: "/language:javascript-typescript"
+
+  # ===========================================================================
+  # 5. DOCKER - spec requirement: "Build the Docker image to ensure the
+  #    Dockerfile is valid" (plus image scanning and runtime assertions)
+  # ===========================================================================
+  docker:
+    name: Docker build & image scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    # Don't spend build minutes on code whose unit tests already failed.
+    needs: [test]
+
+    # Inherits the workflow-level `contents: read` and asks for nothing more.
+    # This job produces no SARIF - the image scan below prints a table - so
+    # `security-events: write` would be an unused grant, and an unused grant is
+    # just latent blast radius.
+
+    steps:
+      - name: Check out the code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      # Buildx enables the GitHub Actions layer cache backend (type=gha) used
+      # below, which the classic builder cannot do.
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
+
+      # Builds the `test` stage, whose `RUN npm test` executes Jest inside
+      # Alpine. The job above tests on Ubuntu/glibc; this tests on the
+      # musl userland that actually ships.
+      #
+      # This step is also the regression test for a subtle .dockerignore bug:
+      # excluding *.test.js from the build context leaves Jest with nothing to
+      # run, and `jest` exits 1 on "No tests found". If this step ever fails
+      # with that message, check .dockerignore before checking the test.
+      - name: Run tests inside the image
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7
+        with:
+          context: .
+          target: test
+          push: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Build runtime image
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7
+        with:
+          context: .
+          target: runtime
+          push: false
+          # Load into the local daemon so the next steps can `docker run` it.
+          # Without this, buildx keeps the result in its cache and `docker run`
+          # fails with "image not found".
+          load: true
+          tags: ${{ env.IMAGE_NAME }}:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # Turns the spec's "should run as a non-root user" from a claim in the
+      # README into an assertion the pipeline enforces on every single commit.
+      # --entrypoint overrides tini so `id -u` runs directly.
+      - name: Assert the container does not run as root
+        run: |
+          uid=$(docker run --rm --entrypoint id "${IMAGE_NAME}:${GITHUB_SHA}" -u)
+          echo "Container UID: $uid"
+          if [ "$uid" = "0" ]; then
+            echo "::error::Container is running as root - failing the build."
+            exit 1
+          fi
+          echo "Running unprivileged (uid $uid)."
+
+      # Proves the multi-stage split actually isolates the dependency trees,
+      # rather than trusting that it does. If someone drops `--omit=dev` from
+      # the deps stage, the image still builds and still serves traffic - this
+      # is the only check that would notice.
+      - name: Assert dev dependencies are absent from the runtime image
+        run: |
+          modules=$(docker run --rm --entrypoint ls "${IMAGE_NAME}:${GITHUB_SHA}" /app/node_modules)
+          if echo "$modules" | grep -qx "jest"; then
+            echo "::error::jest is present in the runtime image - devDependencies are leaking."
+            exit 1
+          fi
+          echo "No jest/supertest in the shipped image."
+
+      # Proves the image doesn't just build, but actually SERVES traffic.
+      # A Dockerfile can compile perfectly and still produce a container that
+      # crashes on boot.
+      - name: Smoke test /health
+        run: |
+          docker run -d --name smoke -p 127.0.0.1:3000:3000 "${IMAGE_NAME}:${GITHUB_SHA}"
+          ok=0
+          for _ in $(seq 1 15); do
+            if curl -fsS http://127.0.0.1:3000/health; then ok=1; break; fi
+            sleep 1
+          done
+          echo "--- container logs ---"
+          docker logs smoke
+          docker rm -f smoke >/dev/null
+          if [ "$ok" != "1" ]; then
+            echo "::error::/health never became reachable."
+            exit 1
+          fi
+
+      # Scans the FINAL artifact: app dependencies AND the Alpine OS packages
+      # underneath them. The filesystem scan in job 3 cannot see the base image.
+      - name: Trivy - image scan (gate)
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          scan-type: image
+          image-ref: ${{ env.IMAGE_NAME }}:${{ github.sha }}
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: "1"
+          format: table
+
+      - name: Report image size
+        if: always()
+        run: |
+          {
+            echo "### Runtime image"
+            echo ""
+            echo "| Tag | Size |"
+            echo "|---|---|"
+            echo "| \`${IMAGE_NAME}:${GITHUB_SHA}\` | $(docker images "${IMAGE_NAME}:${GITHUB_SHA}" --format '{{.Size}}') |"
+          } >> "$GITHUB_STEP_SUMMARY"
