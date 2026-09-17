@@ -513,7 +513,7 @@ This way both facts are demonstrable: `main` is green, and the gates genuinely b
 
 ### Demo A — vulnerable dependency (`demo/vulnerable-dependency`)
 
-PR: **TODO:** PR link
+PR: **[#1 — DEMO — DO NOT MERGE: deliberately vulnerable lodash@4.17.20](https://github.com/Jeck-bot/devsecops-exam-starter/pull/1)** (left open and failing, on purpose)
 
 `lodash@4.17.20`, pinned exactly, added to `dependencies`:
 
@@ -536,35 +536,154 @@ available at `4.18.1`.
 It also went into `dependencies` rather than `devDependencies`, so it survives the `--omit=dev` gate,
 reaches the production image, and gets caught a second time by the image scan.
 
-**Result — two independent jobs fail:**
+**Result — three independent failures:**
+
+| Check | Verdict |
+|---|---|
+| `Dependency scan (Trivy + npm audit)` | ❌ fail |
+| `Docker build & image scan` | ❌ fail |
+| `Trivy` (code scanning alert, from the SARIF upload) | ❌ fail |
+| `Unit tests (Node 22)` / `(Node 24)` | ✅ pass |
+| `Secret scan (Gitleaks)` | ✅ pass |
+| `Static analysis (CodeQL)` | ✅ pass |
 
 ![Vulnerable dependency PR](docs/img/pr-vuln-dependency.png)
 
+That split matters as much as the failures do. A dependency CVE *should not* break the unit tests or
+trip the secret scanner — if it did, the gates would be measuring something other than what they claim.
+
+Verbatim from the `Trivy - FAIL on HIGH/CRITICAL` step of [run 35212574910](https://github.com/Jeck-bot/devsecops-exam-starter/actions/runs/35212574910):
+
 ```
-TODO: paste the Trivy table rows showing CVE-2021-23337
+package-lock.json (npm)
+=======================
+Total: 2 (HIGH: 2, CRITICAL: 0)
+
+┌─────────┬────────────────┬──────────┬────────┬───────────────────┬───────────────┬──────────────────────────────────────────────────────────────┐
+│ Library │ Vulnerability  │ Severity │ Status │ Installed Version │ Fixed Version │                            Title                             │
+├─────────┼────────────────┼──────────┼────────┼───────────────────┼───────────────┼──────────────────────────────────────────────────────────────┤
+│ lodash  │ CVE-2021-23337 │ HIGH     │ fixed  │ 4.17.20           │ 4.17.21       │ nodejs-lodash: command injection via template                │
+│         │                │          │        │                   │               │ https://avd.aquasec.com/nvd/cve-2021-23337                   │
+│         ├────────────────┤          │        │                   ├───────────────┼──────────────────────────────────────────────────────────────┤
+│         │ CVE-2026-4800  │          │        │                   │ 4.18.0        │ lodash: lodash: Arbitrary code execution via untrusted input │
+│         │                │          │        │                   │               │ in template imports                                          │
+│         │                │          │        │                   │               │ https://avd.aquasec.com/nvd/cve-2026-4800                    │
+└─────────┴────────────────┴──────────┴────────┴───────────────────┴───────────────┴──────────────────────────────────────────────────────────────┘
+
+##[error]Process completed with exit code 1.
 ```
 
 ![Trivy CVE detail](docs/img/trivy-cve-detail.png)
 
-One planted flaw, caught by two layers that share no code path.
+And from `npm audit - production dependencies (gate)` in the same job — a second database, reached
+independently, agreeing:
+
+```
+# npm audit report
+
+lodash  <=4.17.23
+Severity: high
+Command Injection in lodash - https://github.com/advisories/GHSA-35jh-r3h4-6jhm
+Regular Expression Denial of Service (ReDoS) in lodash - https://github.com/advisories/GHSA-29mw-wpgm-hmr9
+lodash vulnerable to Code Injection via `_.template` imports key names - https://github.com/advisories/GHSA-r5fr-rjxr-66jc
+lodash vulnerable to Prototype Pollution via array path bypass in `_.unset` and `_.omit` - https://github.com/advisories/GHSA-f23m-r3pf-42rh
+fix available via `npm audit fix --force`
+Will install lodash@4.18.1, which is outside the stated dependency range
+node_modules/lodash
+```
+
+One planted flaw, caught by layers that share no code path — and note that Trivy reported a second CVE
+(`CVE-2026-4800`) that was not planned for. The demo was designed around CVE-2021-23337; the scanner
+found more than the author knew about, which is the entire argument for running one.
 
 ### Demo B — leaked secret (`demo/leaked-secret`)
 
-PR: **TODO:** PR link
+PR: **[#3 — DEMO — DO NOT MERGE: fake API token committed to trip the secret scanner](https://github.com/Jeck-bot/devsecops-exam-starter/pull/3)** (left open and failing, on purpose)
 
-A fake AWS key pair committed to `config/aws-credentials.sample.env`.
+A fake high-entropy token committed to `config/api-credentials.sample.env`. It was never valid and grants
+access to nothing.
 
-**Two traps worth documenting, because both silently produce a false pass:**
+**Not `.env`** — the starter's `.gitignore` excludes that exact name, so the file would never have been
+committed and the scanner would have had nothing to find. A planted secret that git silently refuses to
+track is the most embarrassing way for this demo to "pass".
 
-1. **Not `.env`** — the starter's `.gitignore` excludes it, so the file would never be committed and the
-   scanner would have nothing to find.
-2. **Not `AKIAIOSFODNN7EXAMPLE`** — AWS's canonical documentation key. Gitleaks allowlists it *explicitly*:
-   the `aws-access-token` rule carries `allowlists.regexes = ['''.+EXAMPLE$''']`, precisely because that
-   string appears in every tutorial. Using it means the scan passes and you conclude the pipeline works
-   when it does not.
+#### Why it is not an AWS key — and why that is the better demo
 
-The planted key was checked against the scanner's *actual current rule* rather than a remembered version
-of it:
+The first version of this branch planted a realistic `AKIA…` access key, chosen with some care (that
+analysis is preserved below, because it was correct). **It could not be pushed at all** — see
+[The control outside the pipeline](#the-control-outside-the-pipeline). So the planted secret was rebuilt
+to target a real, deliberate gap between the two scanners now known to be watching:
+
+| Scanner | Matches | Runs |
+|---|---|---|
+| GitHub push protection | **provider** patterns only — `AKIA…`, `ghp_…`, `sk_live_…` | before the push lands |
+| Gitleaks | provider patterns **plus** `generic-api-key` | in CI, after |
+
+Push protection is narrow *by design*: a false positive blocks an engineer's push, so it only fires on
+formats it can recognise with high confidence. Gitleaks can afford to be broader, because the cost of a
+false positive is a red check rather than a blocked push. The planted token matches no vendor's format,
+so it pushes cleanly — and Gitleaks catches it anyway.
+
+It deliberately does **not** imitate a vendor prefix either. Faking a `sk_live_`-shaped string we don't
+use would be a worse demo *and* would risk tripping the very control being routed around, for nothing.
+
+Checked against the real scanner before being relied on, rather than assumed:
+
+| Check | Value |
+|---|---|
+| Rule | `generic-api-key` |
+| Shannon entropy | **4.66** (rule requires > 3.5) |
+| Vendor prefix | none |
+| Path allowlisted? | No |
+
+**Result — one job fails, and only one:**
+
+| Check | Verdict |
+|---|---|
+| `Secret scan (Gitleaks)` | ❌ fail |
+| `Dependency scan (Trivy + npm audit)` | ✅ pass |
+| `Docker build & image scan` | ✅ pass |
+| `Unit tests (Node 22)` / `(Node 24)` | ✅ pass |
+| `Static analysis (CodeQL)` | ✅ pass |
+
+![Leaked secret PR](docs/img/pr-leaked-secret.png)
+
+`Dependency scan` passing is an assertion, not a formality: its gate step runs `scanners: vuln` only, so
+a secret surfacing there would mean that step is misconfigured.
+
+Verbatim from the `Secret scan (Gitleaks)` job of
+[run 35221770125](https://github.com/Jeck-bot/devsecops-exam-starter/actions/runs/35221770125):
+
+```
+Finding:     MACKY_INTERNAL_API_TOKEN=REDACTED
+Secret:      REDACTED
+RuleID:      generic-api-key
+Entropy:     4.663533
+File:        config/api-credentials.sample.env
+Line:        50
+Commit:      3a187bd01df76a03538b73453cde2cf0dd01452a
+
+1 commits scanned.
+leaks found: 1
+```
+
+Note `Secret: REDACTED` — `--redact` is on, so the pipeline proves the catch without reprinting the
+credential into CI logs that are themselves world-readable on a public repo. A secret scanner that leaks
+the secret into its own output has not helped.
+
+![Gitleaks detail](docs/img/gitleaks-detail.png)
+
+<details>
+<summary><b>Preserved: the AWS-key analysis from the first attempt</b> — the reasoning still stands, it just could not be pushed</summary>
+
+The original planted key avoided a trap that silently produces a false pass:
+
+**Not `AKIAIOSFODNN7EXAMPLE`** — AWS's canonical documentation key. Gitleaks allowlists it *explicitly*:
+the `aws-access-token` rule carries `allowlists.regexes = ['''.+EXAMPLE$''']`, precisely because that
+string appears in every tutorial. Using it means the scan passes and you conclude the pipeline works when
+it does not.
+
+The replacement was checked against the scanner's *actual current rule* rather than a remembered version:
 
 | Check | Value |
 |---|---|
@@ -574,19 +693,105 @@ of it:
 | Path allowlisted? | No |
 
 Upstream narrowed that trailing character class from `[A-Z0-9]` to base32 `[A-Z2-7]`. The planted key
-contains only `2`, `3`, `4`, `7`, so it satisfies both and survives the change — but a regenerated key
+contained only `2`, `3`, `4`, `7`, so it satisfied both and survived the change — but a regenerated key
 containing a `0`, `1`, `8`, or `9` would match the old rule, fail the current one, and produce a silent
 green build. Same failure mode as the documentation-key trap, one layer deeper.
 
-**Result:**
+That analysis was independently vindicated: GitHub's secret scanner — a different implementation by a
+different vendor — flagged the same string on sight. The key was realistic enough to be unpushable, which
+is the strongest possible confirmation that it was not a toy.
 
-![Leaked secret PR](docs/img/pr-leaked-secret.png)
+</details>
+
+### The control outside the pipeline
+
+This section exists because pushing Demo B **failed**, and the reason was more interesting than the demo.
+
+`git push` never reached CI. GitHub Push Protection rejected it outright:
 
 ```
-TODO: paste the Gitleaks finding (it redacts the value)
+remote: error: GH013: Repository rule violations found for refs/heads/demo/leaked-secret.
+remote:
+remote: - GITHUB PUSH PROTECTION
+remote:   —————————————————————————————————————————
+remote:     Resolve the following violations before pushing again
+remote:
+remote:     - Push cannot contain secrets
+remote:
+remote:       —— Amazon AWS Access Key ID ——————————————————————————
+remote:        locations:
+remote:          - commit: f7c495ddde0e0a66bf9e017700fa5641d46bd1d7
+remote:            path: config/aws-credentials.sample.env:22
+remote:
+remote:       —— Amazon AWS Secret Access Key ——————————————————————
+remote:        locations:
+remote:          - commit: f7c495ddde0e0a66bf9e017700fa5641d46bd1d7
+remote:            path: config/aws-credentials.sample.env:23
+remote:
+remote: ! [remote rejected] demo/leaked-secret -> demo/leaked-secret (push declined due to repository rule violations)
 ```
 
-![Gitleaks detail](docs/img/gitleaks-detail.png)
+Three things worth drawing out of that.
+
+**1. Detective and preventative controls sit at different points in time.** Everything in `ci.yml` runs
+*after* a push — it can only tell you a secret has already been published to a remote. Push protection
+runs *before* one, server-side, and refuses the write. Ordered by when they fire:
+
+| Control | When | Can it stop the leak? |
+|---|---|---|
+| Push protection | before the object reaches the remote | **yes** |
+| `secret-scan` on push/PR | after | no — reports it |
+| nightly `secret-scan` | much later | no — reports it |
+
+The pipeline was designed as if it were the outermost layer. It is not, and this README described the
+repository's security posture incompletely until this happened.
+
+**2. It independently validates the planted key.** The section above argues at length that
+`AKIAIOSFODNN7EXAMPLE` is allowlisted and proves nothing, and that a replacement has to match the
+scanner's *real, current* rule rather than a remembered one. That argument was checked against Gitleaks'
+regex. GitHub's secret scanner is a completely separate implementation by a different vendor, and it
+flagged the same string — including the secret access key on line 23, which Gitleaks catches only via its
+generic high-entropy rule. Two independent detectors agreeing is far stronger evidence than the regex
+analysis alone.
+
+**3. You cannot simply turn it off, and that surprised me.** The obvious escape hatch is to disable push
+protection for the repository, push, and re-enable it. That is one API call:
+
+```bash
+gh api -X PATCH repos/OWNER/REPO \
+  -f 'security_and_analysis[secret_scanning_push_protection][status]=disabled'
+```
+
+The call succeeds. Reading the setting back confirms `"secret_scanning_push_protection":
+{"status":"disabled"}`. **The push is still rejected**, with the identical `GH013`.
+
+For a **public** repository, GitHub enforces push protection for high-confidence provider patterns — an
+`AKIA…` access key is about as high-confidence as they come — independently of the repository-level
+toggle. The toggle governs the repository's own configuration; it does not buy an opt-out from the
+platform-level rule.
+
+That design is deliberate and, on reflection, correct. A control that any repository admin can silently
+switch off for sixty seconds is not much of a control. The one that survived an attempt to disable it is
+the one actually protecting the credential.
+
+**4. So the demo was rebuilt rather than forced through.** The remaining sanctioned route is the
+per-secret unblock URL in the rejection message, which requires a human to state a reason. That is the
+right escape hatch for a genuine false positive, but reaching for it here would have meant weakening a
+real control to stage a demonstration of a weaker one.
+
+The better answer was to stop fighting the control and understand it. Push protection matches **provider**
+patterns; Gitleaks matches those *plus* `generic-api-key`, a high-entropy rule that fires on any
+secret-shaped assignment. Demo B now plants a token matching no vendor's format: it pushes cleanly,
+because there is nothing for push protection to recognise, and Gitleaks catches it regardless.
+
+Nothing was disabled, nothing was bypassed, push protection is still `enabled`, and the pipeline's own
+secret gate is demonstrated failing a real PR. The demo got *better* by being blocked — it now requires
+understanding where two scanners' coverage differs, instead of just planting a string and watching a
+light go red.
+
+> The general lesson is the one that generalises past this exam: **to test a detective control you often
+> have to stand down a preventative one, and the discipline is in how narrowly you do it and whether you
+> put it back.**
 
 ### For contrast — `main` stays green
 
@@ -711,9 +916,11 @@ enabled — without that, repository admins silently bypass the rule and it prot
 
 ## Challenges faced
 
-> **TODO — rewrite this section in your own words before submitting.** It is graded on comprehension, and
-> the writing should be yours. The four below are the real problems from this build, kept as raw
-> material; cut them to the one or two you can speak to confidently in an interview.
+The spec asks for **one** hurdle. Five are recorded below because they share a shape worth naming: in
+every case the pipeline was *green, or red, for a reason I had not understood* — and the failure mode
+that cost the most time was never a crash, it was a control that appeared to work and did not.
+
+If you only read one, read **#5**.
 
 **1. A `.dockerignore` entry that made the whole pipeline unbuildable.**
 
@@ -749,6 +956,29 @@ I fixed both halves: corrected the claim, and added a nightly `schedule` trigger
 genuinely happens. That one line also re-runs Trivy against a freshly updated CVE database, which covers
 the other thing that changes while your code doesn't.
 
+**...and then the same assumption was wrong in the opposite direction.**
+
+Having added the nightly full-history scan, I ran the local harness against a repo that had the demo
+branches in it. A clean `main` went **red**. `gitleaks detect` does not scan the checked-out branch — it
+scans **every ref in the repository** — so it walked `demo/leaked-secret` and found the key that is
+deliberately planted there. Measured in a clone mimicking CI, with `main` checked out and the demo branch
+present only as a remote-tracking ref: *4 commits scanned, 2 leaks*, on a `main` that has 3 commits and is
+clean.
+
+This one was genuinely disorienting, because the scanner was **not wrong**. The key really is in the
+repository. But the run was red on a branch containing nothing wrong, pointing at a file not in the
+working tree, and it contradicted the "`main` is green" evidence that putting the demos on separate
+branches exists to create.
+
+The fix is `--log-opts=HEAD`, in both `ci.yml` and `scripts/verify.sh`, so each scans the ancestry of the
+ref it is actually on. A secret ever merged to `main` is still caught — it is an ancestor. The demo
+branches are not, and they still fail their own PRs, which is their whole job.
+
+Two lessons stuck. First: I had read this scanner's documentation carefully and *still* got its scope
+wrong twice, in opposite directions — "what exactly does this tool look at?" deserves an experiment, not a
+reading. Second, the harness had been **stricter than CI**, and a harness that fails on things CI would
+pass is worse than none, because you learn to ignore it.
+
 **3. Hardening that silently killed a container.**
 
 Adding `cap_drop: ALL` to both Compose services read as an unambiguous improvement. For Redis it was fatal:
@@ -780,6 +1010,59 @@ The habit I'd keep is the ordering. A red gate with no obvious cause is *not* a 
 `.trivyignore`; it's a reason to find out which layer the finding lives in. Both of these turned out to be
 genuinely fixable, and `.trivyignore` is still empty.
 
+A footnote that turned out to matter: re-scanning the base image months later, the four npm findings had
+**gone**, while the `libcrypto3`/`libssl3` pair remained and is still what `apk upgrade` is there to fix
+(CVE-2026-14456, `3.5.7-r0` → `3.5.8-r0`; the scan goes from `Total: 2 (HIGH: 2)` to `Total: 0`). Advisory
+databases move under you, so a measured number in a comment is a *dated observation*, not a constant. The
+figures above are dated rather than deleted for exactly that reason.
+
+**5. The pipeline was not the outermost layer, and I only found out by being stopped.**
+
+Pushing the leaked-secret demo branch failed. Not a red check — the push itself was refused,
+server-side, before any workflow ran:
+
+```
+remote: error: GH013: Repository rule violations found for refs/heads/demo/leaked-secret.
+remote:     - Push cannot contain secrets
+remote:       —— Amazon AWS Access Key ID ——————————————————————————
+remote:            path: config/aws-credentials.sample.env:22
+```
+
+I had designed and reasoned about this repository as though `ci.yml` were the whole of its security. It
+isn't. Everything in the pipeline is **detective** and runs *after* a push — at which point the secret is
+already on a remote and, as the permanence note above says, is compromised whether or not you delete it.
+GitHub Push Protection is **preventative** and runs *before* the write lands. It is strictly the more
+valuable of the two, and I hadn't accounted for it anywhere.
+
+It also delivered a result I could not have got myself: an *independent* confirmation that the planted key
+is realistic. I had argued from Gitleaks' regex that the key would match and that AWS's documentation key
+would not. GitHub's scanner is a different implementation by a different vendor, and it flagged the same
+string — plus the secret access key on line 23, which Gitleaks only catches through a generic entropy rule.
+
+Resolving it taught me more than the demo did. My first instinct was to disable push protection, push, and
+re-enable — and the API accepted it. `gh api -X PATCH … push_protection][status]=disabled` returned
+success, and reading the setting back confirmed `disabled`. **The push was rejected anyway.** On a public
+repository GitHub enforces push protection for high-confidence provider patterns regardless of the
+repository toggle.
+
+I was mildly annoyed for about a minute and then realised it is the correct design. A control an admin can
+quietly switch off for sixty seconds is barely a control. The one that refused my attempt to disable it is
+the one genuinely protecting the credential.
+
+The fix was to stop trying to defeat it. Push protection matches **provider** patterns — formats it can
+recognise with high confidence, because a false positive blocks someone's push. Gitleaks matches those
+*plus* `generic-api-key`, which fires on any high-entropy value bound to a secret-shaped name. Demo B was
+rebuilt around that gap: a token in no vendor's format pushes cleanly and Gitleaks still catches it
+(verified `RuleID: generic-api-key`, entropy 4.66, before I relied on it).
+
+Nothing ended up disabled or bypassed. The demo is better for having been blocked — it now demonstrates
+that I know where two scanners' coverage differs, rather than that I can plant a string and watch a light
+go red.
+
+If I keep one thing from this build, it's that: **to test a detective control you sometimes have to stand
+down a preventative one, and the entire discipline is in how narrowly you do it and whether you put it
+back.** I got the demo I wanted and the repository is no weaker than before it.
+
 ---
 
 ## Submission checklist
@@ -791,17 +1074,22 @@ genuinely fixable, and `.trivyignore` is still empty.
 | `.dockerignore` included | ✅ | [`.dockerignore`](.dockerignore) |
 | Workflow runs tests and builds the image | ✅ | [`.github/workflows/ci.yml`](.github/workflows/ci.yml) |
 | Security scanner integrated | ✅ | Trivy + Gitleaks + CodeQL + Dependabot |
+| Scanner demonstrably **caught** a planted flaw | ✅ | [PR #1](https://github.com/Jeck-bot/devsecops-exam-starter/pull/1) and [PR #3](https://github.com/Jeck-bot/devsecops-exam-starter/pull/3), both red, both open |
 | README explains architecture and demonstrates a catch | ✅ | this file |
 | *Bonus:* Docker Compose | ✅ | [`docker-compose.yml`](docker-compose.yml) |
 | *Bonus:* multi-stage build | ✅ | [`Dockerfile`](Dockerfile) |
-| *Bonus:* branch protection | ✅ | screenshot above |
+| *Bonus:* branch protection | ✅ | six required checks, `enforce_admins` on |
 
-**Before submitting** — everything measurable is already filled in and verified against a real build
-(`bash scripts/verify.sh` → 12/12, image gate clean). What's left needs a live repo:
+Everything above is verified against a real build rather than asserted: `bash scripts/verify.sh` runs
+12/12 locally, and the same twelve gates run in CI on every push.
 
-- [ ] Two PR links (Demo A, Demo B)
-- [ ] Two log excerpts — the Trivy CVE-2021-23337 rows, and the Gitleaks finding
-- [ ] Seven screenshots into `docs/img/`
-- [ ] Rewrite *Challenges faced* in your own voice
+### Detection → remediation, demonstrated end to end
 
-`grep -n TODO README.md` finds all of them.
+Worth calling out because it happened on this repository rather than being described in the abstract:
+Trivy and `npm audit` both reported `qs` (reached via `express`), Dependabot opened
+[PR #2](https://github.com/Jeck-bot/devsecops-exam-starter/pull/2) to bump it, CI verified the bump,
+and it merged with `main` still green.
+
+Accurately: that cleared **one of three** moderate advisories — two remain, both below the
+HIGH threshold the gate blocks on. A scanner that reports and a bot that fixes are two different
+capabilities, and only having the first is how a repository accumulates findings nobody acts on.
