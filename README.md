@@ -1,6 +1,7 @@
 # Macky Merch API — Secure Delivery Pipeline
 
 ![CI](https://github.com/Jeck-bot/devsecops-exam-starter/actions/workflows/ci.yml/badge.svg)
+[![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/Jeck-bot/devsecops-exam-starter/badge)](https://scorecard.dev/viewer/?uri=github.com/Jeck-bot/devsecops-exam-starter)
 
 LSCS DevSecOps Engineering Challenge — 41st LSCS, Term 1.
 
@@ -33,13 +34,13 @@ delivery pipeline. The application code is unchanged; **the pipeline is the deli
 ## Pipeline at a glance
 
 ```
- push / pull_request -> main          nightly schedule (02:00 UTC)
-            │                                    │
-  ┌─────────┼──────────────┬───────────┐         │
-  ▼         ▼              ▼           ▼         │
- test    secret-scan  dependency-scan codeql  ◄──┘   parallel — fail fast
- (22,24)  Gitleaks    Trivy fs +      JS static
-                      npm audit       analysis
+ push / pull_request -> main              nightly schedule (02:00 UTC)
+            │                                        │
+  ┌─────────┼──────────────┬───────────┬──────────┐  │
+  ▼         ▼              ▼           ▼          ▼  │
+ test    secret-scan  dependency-scan codeql    lint ◄┘  parallel — fail fast
+ (22,24)  Gitleaks    Trivy fs +      JS static  hadolint
+                      npm audit       analysis   + zizmor
   │
   └────────────► docker
                  ├─ build --target test   (jest inside Alpine)
@@ -47,12 +48,22 @@ delivery pipeline. The application code is unchanged; **the pipeline is the deli
                  ├─ assert non-root       ← enforces the spec, every commit
                  ├─ assert no devDeps     ← enforces the multi-stage split
                  ├─ smoke-test /health
-                 └─ Trivy image scan
+                 ├─ Trivy image scan
+                 └─ SBOM (CycloneDX)      ← inventory, not a gate
+
+ push -> main / nightly only
+  └─ scorecard   OpenSSF supply-chain posture — informational, never gates
 ```
 
-Five jobs. Four start immediately; `docker` alone waits — on `test`, so build minutes aren't spent on code
-that's already broken. The scanners deliberately do **not** gate each other, so one red run reports every
-distinct problem at once rather than revealing them one push at a time.
+Six jobs on a pull request. Five start immediately; `docker` alone waits — on `test`, so build minutes
+aren't spent on code that's already broken. The scanners deliberately do **not** gate each other, so one
+red run reports every distinct problem at once rather than revealing them one push at a time.
+
+`lint` is the odd one out, and deliberately so: every other job scans the application or its
+dependencies, and **none of them would notice if the pipeline itself were the insecure part.** The
+Dockerfile and `ci.yml` are where most of this project's security decisions actually live, and they run
+privileged. A repository that scans its code but never scans its build has a blind spot precisely where
+it can least afford one.
 
 ---
 
@@ -107,15 +118,18 @@ npm start
 bash scripts/verify.sh
 ```
 
-Twelve checks: host tests → test-stage build → runtime build → non-root assertion → dev-dependency
+Fourteen checks: host tests → test-stage build → runtime build → non-root assertion → dev-dependency
 isolation → `/health` smoke test → prompt shutdown → the Compose stack with DNS resolution → a
 full-history Gitleaks scan → a Trivy dependency gate → the production `npm audit` gate → a Trivy
-scan of the shipped image. Exits 0 only if all pass.
+scan of the shipped image → hadolint → zizmor. Exits 0 only if all pass.
 
-That list is deliberately identical to the set of gates in `ci.yml`, and it did not start out that
-way. The last two were CI-only for a while, which meant the first time they ever ran was the push
-that would have turned `main` red. A harness that covers *most* of the pipeline tells you the least
-on exactly the days you need it most.
+That list is deliberately identical to the set of gates in `ci.yml`, and it has had to be re-earned
+twice. First when `npm audit --omit=dev` and the image scan were CI-only; again when `lint` added
+hadolint and zizmor. Both times the gap had the same shape — CI could reject a push this script had
+just called clean, and the first place you'd find out is the push that turns `main` red.
+
+The rule that falls out of it: **adding a gate to `ci.yml` isn't finished until it's also a step here.**
+A harness that covers *most* of the pipeline tells you the least on exactly the days you need it most.
 
 ---
 
@@ -405,13 +419,16 @@ nightly schedule.
 | `secret-scan` | Gitleaks over the event's commits (full history nightly) | a credential was committed |
 | `dependency-scan` | Trivy `fs` + `npm audit` | a dependency has a fixable HIGH/CRITICAL CVE |
 | `codeql` | GitHub static analysis (`security-extended`) | a dataflow vulnerability in the source |
-| `docker` | builds both stages, asserts non-root and dep isolation, smoke-tests `/health`, scans the image | the artefact is invalid or vulnerable |
+| `lint` | hadolint on the Dockerfile, zizmor on the workflows | the *pipeline* has a defect |
+| `docker` | builds both stages, asserts non-root and dep isolation, smoke-tests `/health`, scans the image, emits an SBOM | the artefact is invalid or vulnerable |
+| `scorecard` | OpenSSF supply-chain posture — `main`/nightly only | *(never gates — informational)* |
 
 Deliberate choices worth calling out:
 
 - **`permissions: contents: read` at the top.** The `GITHUB_TOKEN` starts read-only; only
-  `dependency-scan` and `codeql` opt into `security-events: write` for SARIF. The `docker` job asks for
-  nothing extra, because it uploads no SARIF — an unused grant is just latent blast radius.
+  `dependency-scan`, `codeql` and `scorecard` opt into `security-events: write` for SARIF. The `docker`
+  and `lint` jobs ask for nothing extra, because they upload none — an unused grant is just latent blast
+  radius.
 - **Every third-party action pinned to a full commit SHA**, tag in a trailing comment. This is the control
   that actually backs the line above: least privilege limits what a compromised action can *do*; SHA
   pinning limits what can *become* a compromised action. `@v7` is a pointer the upstream owner can move at
@@ -437,7 +454,9 @@ Deliberate choices worth calling out:
 
 ## Security integration
 
-Three scanners, chosen to cover different axes rather than duplicate each other.
+Five scanners, chosen to cover different axes rather than duplicate each other. The spec asks for *at
+least one*; these were added because each closes a gap the others structurally cannot see, not to run up
+a count.
 
 | Threat | Tool | Job | Blocking |
 |---|---|---|---|
@@ -448,6 +467,10 @@ Three scanners, chosen to cover different axes rather than duplicate each other.
 | Secret in the commits being pushed | Gitleaks | `secret-scan` | ✅ |
 | Secret **anywhere in git history** | Gitleaks (nightly) | `secret-scan` | ✅ |
 | Uncatalogued dataflow vulnerability | CodeQL | `codeql` | ✅ |
+| Insecure **Dockerfile** construction | hadolint | `lint` | ✅ |
+| Insecure **workflow** construction | zizmor | `lint` | ✅ |
+| "What is actually inside the shipped image?" | Trivy CycloneDX SBOM | `docker` | artefact |
+| Repository-level supply-chain posture | OpenSSF Scorecard | `scorecard` | report |
 | Dockerfile / Compose misconfiguration | Trivy `misconfig` | `dependency-scan` | report |
 
 **Why Trivy?** One static binary covering four scan classes — dependencies, OS packages, secrets, and
@@ -466,6 +489,77 @@ bug nobody has catalogued yet. CodeQL builds a dataflow graph of the source and 
 reaching a dangerous sink. Three tools, three genuinely different failure modes. (`security-extended` is
 justified here because the codebase is ~20 lines: the usual objection to that suite is false-positive
 volume, and there is no volume.)
+
+### Who scans the pipeline?
+
+Those three all scan the *application*. None of them would notice if the insecure thing were the build
+itself — and the build is privileged code: it runs with a repository token, pulls third-party actions,
+and produces the artefact everything else is busy validating. That's the blind spot `lint` covers.
+
+**hadolint** lints the Dockerfile. It found three things, and the split between them is the point:
+
+| Finding | Verdict |
+|---|---|
+| `DL3025` — shell-form `HEALTHCHECK` | **Fixed.** Exec form avoids forking `/bin/sh` every 30s for the life of the container, and now matches the healthcheck `docker-compose.yml` already used. |
+| `DL3066` — `USER node` is non-numeric | **Fixed.** `USER 1000:1000` is the same account, but a name only resolves *inside* the image. Kubernetes' `runAsNonRoot` cannot verify a username is non-zero and refuses to schedule the pod; a number is checkable from the manifest. |
+| `DL3018` — unpinned `apk add tini` | **Suppressed, with the reasoning inline.** |
+
+That last one is the interesting one. DL3018 wants `apk add tini=0.19.0-r3`, and the rule is generally
+right — but here it contradicts the `apk upgrade` on the same line, which exists specifically to take
+current security patches. Pinning an exact `-rN` revision would also break the build outright the moment
+Alpine rebuilds the package, since old revisions drop out of the index. So it's disabled on one line,
+next to the code it excuses, rather than globally in a config file. Same standard `.trivyignore` sets: an
+exception has to argue for itself.
+
+**zizmor** audits the workflows — unpinned actions, over-broad `permissions`, credential persistence,
+and `${{ }}` expressions interpolated into `run:` blocks where they could inject shell. It is the tool
+that independently checks the claims this README makes. Arguing that a pipeline is hardened is cheap;
+having a purpose-built auditor agree is not. `ci.yml` currently reports **no findings**.
+
+It did flag something, though — in `dependabot.yml`, and it's the most counter-intuitive control here:
+
+> **`cooldown`, or: the remediation path is itself attack surface.**
+>
+> Every other control in this repository pushes toward updating *faster*. Cooldown pushes the other way,
+> because package compromises are overwhelmingly **opportunistic** — an attacker who gets a malicious
+> version published expects it to be yanked within hours once someone notices. The window they're
+> actually farming is the one where automation pulls the release before any human has looked at it. A
+> pipeline that auto-bumps to a version published twenty minutes ago isn't being diligent; it's
+> volunteering to be the canary.
+>
+> **What makes this safe to adopt:** cooldown does not apply to security updates. Per GitHub's Dependabot
+> reference, *"This default cooldown does not apply to security updates"* — advisory-driven fixes bypass
+> it entirely. So it slows down *"there is a newer version"* and never slows down *"the version you have
+> is vulnerable."* Those are different events and only one is urgent. Set to 7 days here (14 for majors);
+> Dependabot's built-in default is 3.
+
+### The SBOM, and why an inventory outlives a scan
+
+The `docker` job emits a CycloneDX SBOM of the finished image and uploads it as a build artefact.
+
+Trivy already scans that image two steps earlier, so why bother? Because a scan answers *"is anything
+vulnerable **today**"*, against today's advisory database — a point-in-time verdict that starts decaying
+immediately. An SBOM answers *"what is in here"*, which doesn't decay. When a CVE drops next month, the
+question is whether this image is affected, and an inventory answers it in seconds without a rebuild or
+a rescan of an image nobody kept.
+
+It's generated with the `trivy-action` already pinned above rather than by adding a dedicated SBOM
+action. This project's whole argument is that every third-party action is supply-chain surface; pulling
+in another vendor to emit a file the existing scanner already produces would undercut it.
+
+### Scorecard — the one verdict this repo didn't write itself
+
+Every other check here was designed by the same person who designed the thing being checked. OpenSSF
+Scorecard is the outside opinion: it grades the repository against recognised supply-chain criteria —
+pinned dependencies, least-privilege tokens, branch protection, a security policy, maintained
+dependencies, CI tests.
+
+**It never gates**, and it runs only on `main` and the nightly schedule. Two reasons: it measures
+repository *settings* as much as file contents, so per-PR runs would score the same posture repeatedly;
+and several checks legitimately cannot score full marks here — `Fuzzing` and `Signed-Releases` don't
+apply to a coursework fork with no releases, and `Branch-Protection` reads low because the default token
+can't read protection settings without an admin-scoped PAT. **A gate that fails for reasons nobody can
+act on is the exact anti-pattern this repository argues against everywhere else**, so it reports instead.
 
 ### Gitleaks scope — stated precisely, because it's easy to get wrong
 
@@ -946,7 +1040,7 @@ docker compose exec api node -e "require('dns').promises.lookup('cache').then(co
 
 ### Branch protection
 
-`main` requires all six status checks to pass before merging, with **"do not allow bypassing"**
+`main` requires all seven status checks to pass before merging, with **"do not allow bypassing"**
 enabled — without that, repository admins silently bypass the rule and it protects nobody.
 
 | Required check | Job |
@@ -956,6 +1050,7 @@ enabled — without that, repository admins silently bypass the rule and it prot
 | `Secret scan (Gitleaks)` | `secret-scan` |
 | `Dependency scan (Trivy + npm audit)` | `dependency-scan` |
 | `Static analysis (CodeQL)` | `codeql` |
+| `Lint (Dockerfile + workflows)` | `lint` |
 | `Docker build & image scan` | `docker` |
 
 > Those are the job **`name:` values**, not the job IDs. GitHub registers a status check under the
@@ -1136,10 +1231,10 @@ figures above are dated rather than deleted for exactly that reason.
 | README explains architecture and demonstrates a catch | ✅ | this file |
 | *Bonus:* Docker Compose | ✅ | [`docker-compose.yml`](docker-compose.yml) |
 | *Bonus:* multi-stage build | ✅ | [`Dockerfile`](Dockerfile) |
-| *Bonus:* branch protection | ✅ | six required checks, `enforce_admins` on |
+| *Bonus:* branch protection | ✅ | seven required checks, `enforce_admins` on |
 
 Everything above is verified against a real build rather than asserted: `bash scripts/verify.sh` runs
-12/12 locally, and the same twelve gates run in CI on every push.
+14/14 locally, and the same fourteen gates run in CI on every push.
 
 ### Detection → remediation, demonstrated end to end
 
