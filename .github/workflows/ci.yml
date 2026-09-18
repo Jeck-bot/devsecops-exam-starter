@@ -39,6 +39,18 @@
 # maintainer can change what runs in this pipeline without anything in this file
 # changing. A SHA is immutable - it is the artifact, not a name for it.
 #
+# The comments carry the EXACT release (`# v7.0.1`), not the floating major
+# (`# v7`). zizmor's `ref-version-mismatch` audit flagged the loose form, and it
+# is right: the comment is the only human-readable record of what the SHA is,
+# and "v7" does not identify a release - it names a pointer that has already
+# moved by the time anyone reads it. A reviewer checking the pin needs to know
+# which version they are approving.
+#
+# Worth noting how this was caught: locally the harness runs zizmor with
+# `--offline`, and this audit needs the API to resolve a SHA back to its tags.
+# The gap only appeared in CI. An offline linter is a weaker linter, and the
+# local run says so rather than pretending otherwise.
+#
 # This is the control that actually backs up the `permissions:` block below:
 # least privilege limits what a compromised action can DO, SHA pinning limits
 # what can BECOME a compromised action. Dependabot (`github-actions` ecosystem)
@@ -111,7 +123,7 @@ jobs:
 
     steps:
       - name: Check out the code
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           # checkout writes the job's token into .git/config by default, where
           # it stays readable by every later step and any process they spawn.
@@ -119,7 +131,7 @@ jobs:
           persist-credentials: false
 
       - name: Set up Node.js
-        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: ${{ matrix.node }}
           cache: npm # caches ~/.npm, keyed on package-lock.json
@@ -146,7 +158,7 @@ jobs:
 
     steps:
       - name: Check out the code (full history)
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           # Required. checkout defaults to a shallow clone (fetch-depth: 1).
           #
@@ -179,7 +191,7 @@ jobs:
       # Free for personal accounts; organisation accounts need GITLEAKS_LICENSE.
       - name: Run Gitleaks (commit range)
         if: github.event_name == 'push' || github.event_name == 'pull_request'
-        uses: gitleaks/gitleaks-action@e0c47f4f8be36e29cdc102c57e68cb5cbf0e8d1e # v3
+        uses: gitleaks/gitleaks-action@e0c47f4f8be36e29cdc102c57e68cb5cbf0e8d1e # v3.0.0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
@@ -227,12 +239,12 @@ jobs:
 
     steps:
       - name: Check out the code
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
       - name: Set up Node.js
-        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: "24"
           cache: npm
@@ -286,7 +298,7 @@ jobs:
           skip-setup-trivy: true # reuse the binary installed in pass 1
 
       - name: Upload SARIF to the Security tab
-        uses: github/codeql-action/upload-sarif@b96794f015dfd88f77b49b1c93e0fa7110f94c63 # v4
+        uses: github/codeql-action/upload-sarif@b96794f015dfd88f77b49b1c93e0fa7110f94c63 # v4.38.0
         if: always()
         # Code scanning uploads require a PUBLIC repo (or GitHub Advanced
         # Security). On a private repo this step 403s - which should degrade
@@ -373,12 +385,12 @@ jobs:
 
     steps:
       - name: Check out the code
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
       - name: Initialise CodeQL
-        uses: github/codeql-action/init@b96794f015dfd88f77b49b1c93e0fa7110f94c63 # v4
+        uses: github/codeql-action/init@b96794f015dfd88f77b49b1c93e0fa7110f94c63 # v4.38.0
         with:
           languages: javascript-typescript
           # `security-extended` runs the standard suite plus lower-precision
@@ -389,7 +401,7 @@ jobs:
       # JavaScript is a "no-build" language for CodeQL - the extractor reads the
       # source directly, so there is no build step between init and analyze.
       - name: Perform CodeQL analysis
-        uses: github/codeql-action/analyze@b96794f015dfd88f77b49b1c93e0fa7110f94c63 # v4
+        uses: github/codeql-action/analyze@b96794f015dfd88f77b49b1c93e0fa7110f94c63 # v4.38.0
         with:
           category: "/language:javascript-typescript"
 
@@ -412,7 +424,7 @@ jobs:
 
     steps:
       - name: Check out the code
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
@@ -478,14 +490,14 @@ jobs:
 
     steps:
       - name: Check out the code
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
       # Buildx enables the GitHub Actions layer cache backend (type=gha) used
       # below, which the classic builder cannot do.
       - name: Set up Buildx
-        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
       # Builds the `test` stage, whose `RUN npm test` executes Jest inside
       # Alpine. The job above tests on Ubuntu/glibc; this tests on the
@@ -496,7 +508,7 @@ jobs:
       # run, and `jest` exits 1 on "No tests found". If this step ever fails
       # with that message, check .dockerignore before checking the test.
       - name: Run tests inside the image
-        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
           target: test
@@ -505,7 +517,7 @@ jobs:
           cache-to: type=gha,mode=max
 
       - name: Build runtime image
-        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
           target: runtime
@@ -603,7 +615,7 @@ jobs:
           skip-setup-trivy: true
 
       - name: Upload SBOM
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: sbom-cyclonedx-${{ github.sha }}
           path: sbom.cdx.json
@@ -665,7 +677,7 @@ jobs:
 
     steps:
       - name: Check out the code
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
@@ -679,7 +691,7 @@ jobs:
           publish_results: true
 
       - name: Upload Scorecard SARIF
-        uses: github/codeql-action/upload-sarif@b96794f015dfd88f77b49b1c93e0fa7110f94c63 # v4
+        uses: github/codeql-action/upload-sarif@b96794f015dfd88f77b49b1c93e0fa7110f94c63 # v4.38.0
         if: always()
         continue-on-error: true
         with:
