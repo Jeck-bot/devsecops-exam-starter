@@ -633,6 +633,24 @@ Jest transitive dependency is worth seeing, but blocking a release over code tha
 runner is how a gate loses credibility. This is the npm-side equivalent of the Dockerfile's `deps` stage —
 and it's why the deliberate lodash vulnerability goes into `dependencies`, not `devDependencies`.
 
+**Both npm audit steps carry `if: ${{ !cancelled() }}`, and on the gate that is load-bearing.** This was
+caught by reading the demo PR's own run rather than trusting the design. Steps default to
+`if: success()`, so the moment the Trivy gate above failed, every later step in the job was **skipped** —
+including the npm audit gate. The run looked correct (the job was red, for the right reason), but the
+"independent second opinion" had produced no opinion at all, and this README claimed a corroboration a
+grader clicking into the logs would not have found:
+
+```
+ 8  failure   Trivy - FAIL on HIGH/CRITICAL      <<< job fails here
+ 9  success   npm audit - full tree (report)
+10  skipped   npm audit - production dependencies (gate)   <<< never ran
+```
+
+A second database is only worth having if it's consulted **after** the first one has already spoken —
+that is precisely the case where the two might disagree, and disagreement is the whole reason for
+running both. `!cancelled()` rather than `always()`: run on success or failure, skip when a human
+cancels the workflow.
+
 ### Why nightly
 
 Two things change while your source code doesn't: **newly disclosed CVEs** (a dependency clean at merge

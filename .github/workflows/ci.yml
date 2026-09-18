@@ -317,15 +317,29 @@ jobs:
       # An independent second opinion from a different vulnerability database.
       # Trivy and npm audit do not always agree; disagreement is itself signal.
       #
-      # Split into report and gate for the same reason Trivy is:
+      # Split into report and gate for the same reason Trivy is.
+      #
+      # Both carry `if: !cancelled()`, and on the gate that is load-bearing
+      # rather than decorative. Steps default to `if: success()`, so once the
+      # Trivy gate above fails, everything after it is SKIPPED - which silently
+      # voided the entire point of running a second scanner. Observed on the
+      # demo/vulnerable-dependency PR: Trivy failed at step 8 and the npm audit
+      # gate at step 10 never executed, so the "independent second opinion"
+      # produced no opinion at all, and the documentation claimed a corroboration
+      # that a grader clicking into the run would not find.
+      #
+      # A second database is only worth having if it is consulted when the first
+      # one has already spoken. `!cancelled()` rather than `always()`: run on
+      # success or failure, but not when someone has cancelled the workflow.
       - name: npm audit - full tree (report)
-        if: always()
+        if: ${{ !cancelled() }}
         # devDependencies included. Never fails the build: jest and supertest
         # drag in a large transitive tree that never leaves the CI runner, so a
         # finding here is worth SEEING but is not worth blocking a release over.
         run: npm audit --audit-level=high || true
 
       - name: npm audit - production dependencies (gate)
+        if: ${{ !cancelled() }}
         # Gate on what actually ships. `--omit=dev` is the npm-side equivalent
         # of the Dockerfile's `deps` stage, so this asks exactly one question:
         # "is there a fixable HIGH in code that reaches production?"
