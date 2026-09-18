@@ -11,6 +11,19 @@
 IMAGE ?= macky-merch-api:local
 PORT  ?= 3000
 
+# Pinned by digest, matching scripts/verify.sh and the argument ci.yml makes for
+# SHA-pinning every action: a tag is a pointer someone else can move. Trivy
+# fetches its vulnerability database at runtime, so pinning the image freezes
+# the scanner, not the advisories it scans against.
+TRIVY_IMAGE ?= aquasec/trivy@sha256:62b1e65e8869bc4b4c6aa4fa2b21595256c7c2f6018a9d9ad61caf87187c1969
+
+# Scanning a local image means handing the scanner the Docker socket.
+#
+# The leading slash is doubled for Git Bash on Windows, which would otherwise
+# rewrite /var/run/... into a C:\ path before Docker sees it. Docker treats the
+# doubled form identically on Linux and macOS, so one value works everywhere.
+DOCKER_SOCK ?= //var/run/docker.sock
+
 .DEFAULT_GOAL := help
 .PHONY: help up down logs test build run verify scan clean
 
@@ -42,11 +55,11 @@ test: ## Install dependencies and run the Jest suite on the host
 	npm ci
 	npm test
 
-verify: ## Run all 12 gates locally - the same set ci.yml runs
+verify: ## Run all 14 gates locally - the same set ci.yml runs
 	bash scripts/verify.sh
 
 scan: build ## Scan the shipped image for fixable HIGH/CRITICAL CVEs
-	docker run --rm -v /var/run/docker.sock:/var/run/docker.sock aquasec/trivy:latest \
+	docker run --rm -v $(DOCKER_SOCK):/var/run/docker.sock $(TRIVY_IMAGE) \
 	  image $(IMAGE) --no-progress --scanners vuln \
 	  --severity HIGH,CRITICAL --ignore-unfixed --exit-code 1
 
