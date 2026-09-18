@@ -3,6 +3,36 @@
 # Trivy in ci.yml is DETECTIVE: it tells you a vulnerable package is already in
 # the tree. Dependabot is PREVENTATIVE: it opens the PR that removes it.
 # A scanner without a remediation path just produces a red build nobody can fix.
+#
+# -----------------------------------------------------------------------------
+# On `cooldown` - the remediation path is itself attack surface.
+#
+# Added after zizmor's `dependabot-cooldown` audit flagged all three ecosystems.
+# The argument is genuinely counter-intuitive and worth stating, because every
+# other control in this repository pushes toward updating FASTER:
+#
+# Package compromises are overwhelmingly OPPORTUNISTIC. An attacker who gets a
+# malicious version published expects it to be yanked within hours or days once
+# someone notices - so the window they are actually farming is the one where
+# automation pulls the release before any human has looked at it. A pipeline
+# that auto-bumps to a version published twenty minutes ago is not being
+# diligent; it is volunteering to be the canary.
+#
+# A cooldown says: let a release face the internet for a week before this repo
+# adopts it. It costs a week of latency on routine version bumps, and buys the
+# chance that a compromised or simply broken release is withdrawn before it ever
+# reaches a PR here.
+#
+# THE PART THAT MAKES THIS SAFE: cooldown does not apply to security updates.
+# Per GitHub's Dependabot options reference - "This default cooldown does not
+# apply to security updates" - advisory-driven fixes bypass it entirely. So this
+# slows down "there is a newer version" and does not slow down "the version you
+# have is vulnerable". Those are different events and only one of them is
+# urgent.
+#
+# Dependabot's built-in default is 3 days; zizmor's threshold, and the value
+# used here, is 7.
+# -----------------------------------------------------------------------------
 
 version: 2
 
@@ -19,24 +49,45 @@ updates:
     groups:
       minor-and-patch:
         update-types: [minor, patch]
+    cooldown:
+      default-days: 7
+      # Majors get longer. A breaking change discovered late is expensive to
+      # unpick, and there is never a reason to be first through the door on one.
+      semver-major-days: 14
     commit-message:
       prefix: "chore(deps)"
 
   # --- Base image in the Dockerfile ----------------------------------------
-  # Catches the case where node:24-alpine ships a patched OS package.
+  # Catches the case where node:24-alpine ships a patched OS package, and bumps
+  # the `FROM ...@sha256:` digest pin so pinning does not mean going stale.
+  #
+  # SCOPE, checked in dependabot-core rather than assumed: this ecosystem
+  # matches `/dockerfile|containerfile/i` plus Kubernetes YAML. It does NOT read
+  # docker-compose.yml, so the `redis:7-alpine` reference there is deliberately
+  # left on a tag - see the note in that file. Nothing here would maintain a
+  # digest pin in a Compose file, and an unmaintained pin is worse than a tag.
+  #
+  # Also note: the docker ecosystem supports VERSION updates only. There are no
+  # Dependabot security updates for base images, which is a second reason the
+  # Dockerfile runs `apk upgrade` at build time rather than waiting for a bump.
   - package-ecosystem: docker
     directory: "/"
     schedule:
       interval: weekly
+    cooldown:
+      default-days: 7
     commit-message:
       prefix: "chore(docker)"
 
   # --- The pipeline's own dependencies -------------------------------------
   # Third-party Actions execute with access to the repo and its secrets, so
   # they are a supply-chain surface in exactly the same way npm packages are.
+  # This is the ecosystem that keeps the SHA pins in ci.yml current.
   - package-ecosystem: github-actions
     directory: "/"
     schedule:
       interval: weekly
+    cooldown:
+      default-days: 7
     commit-message:
       prefix: "ci(deps)"
