@@ -9,12 +9,17 @@
 #
 # Exits 0 only if everything passes.
 #
-# "Every gate" is meant literally, and it did not used to be. This script had
-# ten checks and CI had twelve: the production `npm audit` gate and the Trivy
-# IMAGE scan were only ever exercised on the runner. That is the worst place to
-# discover them, because the first time they run is the push that turns main
-# red. Steps 11 and 12 exist to close that gap - a local pass should mean CI
-# passes, or the harness is lying to you.
+# "Every gate" is meant literally, and it has had to be re-earned twice.
+#
+# First at ten checks, when CI had twelve: the production `npm audit` gate and
+# the Trivy IMAGE scan ran only on the runner. Then again at twelve, when the
+# `lint` job added hadolint and zizmor to CI. Both times the gap was the same
+# shape - CI could reject a push that this script had just called clean, and the
+# first place you would find out is the push that turns main red.
+#
+# Steps 11-14 exist to close those gaps. A local pass should mean CI passes, or
+# the harness is lying to you. The rule this implies is worth stating: adding a
+# gate to ci.yml is not finished until it is also a step here.
 #
 # The image scan in particular is not redundant with step 10: the filesystem
 # scan reads package-lock.json, and cannot see the Alpine OS packages or
@@ -88,6 +93,30 @@ run() {
   return "$rc"
 }
 
+# --- Scanner images, pinned by digest ----------------------------------------
+#
+# ci.yml pins every action to an immutable SHA and the Dockerfile pins its base
+# image to a digest, both on the argument that "a tag is a pointer someone else
+# can move; a digest is the artifact itself". This harness runs four scanners as
+# containers, and used `:latest` for all of them - which is the same class of
+# trust the rest of the project refuses to extend. These are pinned for the same
+# reason, and they are the exact images the current results were produced with.
+#
+# Two honest caveats, because pinning is not free:
+#
+#   1. Dependabot does not read shell scripts, so nothing refreshes these
+#      automatically the way it refreshes ci.yml. They need a periodic manual
+#      bump; CI, which Dependabot does cover, remains the authority.
+#   2. Pinning a SCANNER can freeze its detection rules, which is a real cost -
+#      an out-of-date scanner is its own failure mode. It applies to gitleaks,
+#      whose rules are compiled into the binary. It does NOT apply to Trivy:
+#      Trivy downloads its vulnerability database at runtime, so a pinned Trivy
+#      image still scans against today's advisories.
+GITLEAKS_IMAGE="zricethezav/gitleaks@sha256:c00b6bd0aeb3071cbcb79009cb16a60dd9e0a7c60e2be9ab65d25e6bc8abbb7f"
+TRIVY_IMAGE="aquasec/trivy@sha256:62b1e65e8869bc4b4c6aa4fa2b21595256c7c2f6018a9d9ad61caf87187c1969"
+HADOLINT_IMAGE="hadolint/hadolint@sha256:32dac94127fd60b7b7e3fbfc65e1383b9b5e25c9bfd7b8536de7a539fe68a12d"
+ZIZMOR_IMAGE="ghcr.io/zizmorcore/zizmor@sha256:a2eb396d886c053073405c7a980f2139ba2248ec172243cfa3841e57196e8101"
+
 # Trivy ships its ~114MB vulnerability database inside its cache directory, and
 # `docker run --rm` throws that away every single run - so every invocation
 # re-downloads it. That is slow, and it is flaky: a run failed here with
@@ -101,21 +130,30 @@ trivy() { docker run --rm -v "$TRIVY_CACHE:/root/.cache/trivy" "$@"; }
 cleanup() { docker rm -f "$CONTAINER" >/dev/null 2>&1 || true; }
 trap cleanup EXIT
 
-printf '\n%s  Macky Merch API - local verification%s   %s12 checks%s\n' \
+printf '\n%s  Macky Merch API - local verification%s   %s14 checks%s\n' \
   "$BOLD" "$OFF" "$DIM" "$OFF"
 printf '  %sbranch %s  ·  detail %s%s\n\n' \
   "$DIM" "$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo '?')" "$DETAIL" "$OFF"
 
 # -----------------------------------------------------------------------------
-step "1/12" "Node unit tests (host)"
+step "1/14" "Node unit tests (host)"
 run npm ci --no-fund --no-audit --loglevel=error || die "npm ci failed"
 run npm test || die "jest suite failed"
 # Jest writes its summary to stderr, so it is in the detail log either way.
-tests="$(grep -aoE 'Tests: +[0-9]+ passed' "$DETAIL" | tail -1 | grep -oE '[0-9]+' || echo '?')"
+#
+# The `sed` is required, not defensive. Jest emits ANSI colour codes even when
+# its output is redirected to a file, and it puts them INSIDE the summary line:
+#
+#   ESC[1mTests:       ESC[22mESC[1mESC[32m1 passedESC[39mESC[22m, 1 total
+#
+# so a plain `grep -oE 'Tests: +[0-9]+ passed'` never matches and the step
+# reported "? test(s)" on every run - a check silently losing the one
+# measurement that justifies it. Strip the escapes first, then match.
+tests="$(sed 's/\x1b\[[0-9;]*m//g' "$DETAIL" | grep -aoE 'Tests: +[0-9]+ passed' | tail -1 | grep -oE '[0-9]+' || echo '?')"
 ok "$tests test(s), node $(node -v)"
 
 # -----------------------------------------------------------------------------
-step "2/12" "Test stage build (jest in Alpine)"
+step "2/14" "Test stage build (jest in Alpine)"
 # Also the regression test for the .dockerignore trap: excluding *.test.js from
 # the build context leaves jest with nothing to run, and jest exits 1 on
 # "No tests found". If this fails with that message, the bug is in
@@ -125,7 +163,7 @@ run docker build --progress quiet --target test -t "$FAT_IMAGE" . \
 ok
 
 # -----------------------------------------------------------------------------
-step "3/12" "Runtime image build"
+step "3/14" "Runtime image build"
 # --target runtime explicitly. A bare `docker build .` happens to produce the
 # same image only because runtime is the last stage in the file; relying on
 # stage ordering is exactly the fragility docker-compose.yml warns about.
@@ -133,13 +171,13 @@ run docker build --progress quiet --target runtime -t "$IMAGE" . || die "runtime
 ok "$(docker images "$IMAGE" --format '{{.Size}}')"
 
 # -----------------------------------------------------------------------------
-step "4/12" "Non-root check (spec requirement)"
+step "4/14" "Non-root check (spec requirement)"
 uid="$(docker run --rm --entrypoint id "$IMAGE" -u)"
 [ "$uid" != "0" ] || die "container runs as root (uid 0)"
 ok "uid $uid"
 
 # -----------------------------------------------------------------------------
-step "5/12" "Dev deps absent from the image"
+step "5/14" "Dev deps absent from the image"
 # Captured to a variable first, then matched with a here-string. The obvious
 # `docker run ... | grep -qx jest` is subtly wrong under `set -o pipefail`:
 # grep -q exits the moment it matches, the upstream `ls` can then take SIGPIPE
@@ -153,7 +191,7 @@ fi
 ok "$(wc -l <<<"$modules" | tr -d ' ') packages, no jest/supertest"
 
 # -----------------------------------------------------------------------------
-step "6/12" "Smoke test /health"
+step "6/14" "Smoke test /health"
 cleanup
 # Bound to 127.0.0.1, matching docker-compose.yml. A bare -p 3000:3000 binds
 # 0.0.0.0 and publishes this container to every device on the local network.
@@ -168,7 +206,7 @@ printf '%s\n' "$health" >>"$DETAIL"
 ok "200 $(grep -o '"status":"[^"]*"' <<<"$health")"
 
 # -----------------------------------------------------------------------------
-step "7/12" "Prompt shutdown (tini forwards SIGTERM)"
+step "7/14" "Prompt shutdown (tini forwards SIGTERM)"
 start=$(date +%s)
 docker stop "$CONTAINER" >>"$DETAIL" 2>&1
 elapsed=$(( $(date +%s) - start ))
@@ -180,7 +218,7 @@ ok "${elapsed}s"
 cleanup
 
 # -----------------------------------------------------------------------------
-step "8/12" "Compose stack + service DNS"
+step "8/14" "Compose stack + service DNS"
 run docker compose up -d --build --quiet-pull || die "compose stack failed to start"
 docker compose ps >>"$DETAIL" 2>&1
 if ! curl -fsS http://127.0.0.1:3000/health >/dev/null 2>&1; then
@@ -197,7 +235,7 @@ run docker compose down -v || true
 ok "cache -> $(tr -d '\r\n' <<<"$cache_ip")"
 
 # -----------------------------------------------------------------------------
-step "9/12" "Secret scan (Gitleaks)"
+step "9/14" "Secret scan (Gitleaks)"
 # Mirrors the nightly CI run rather than the per-push one: it walks history
 # rather than a commit range, which is the check worth running before you push
 # something you cannot un-publish.
@@ -212,26 +250,26 @@ step "9/12" "Secret scan (Gitleaks)"
 # things CI would pass, and you learn to ignore it. Local and CI now ask the
 # identical question - "is there a secret in the history of the branch we
 # ship?" - and the demo branches still fail their own PRs, which is their job.
-run docker run --rm -v "$(pwd):/repo" zricethezav/gitleaks:latest \
+run docker run --rm -v "$(pwd):/repo" "$GITLEAKS_IMAGE" \
       detect --source /repo --redact -v --no-banner --log-opts=HEAD \
   || die "gitleaks found a secret (expected on demo/leaked-secret)"
 ok "$(grep -aoE '[0-9]+ commits scanned' "$DETAIL" | tail -1), 0 leaks"
 
 # -----------------------------------------------------------------------------
-step "10/12" "Dependency scan (Trivy fs)"
+step "10/14" "Dependency scan (Trivy fs)"
 # Same thresholds as the CI gate: HIGH/CRITICAL only, and --ignore-unfixed so a
 # CVE with no available patch does not fail a build nobody can act on.
 # --no-progress, NOT --quiet. `--quiet` also suppresses log output, which means
 # a failing scan prints nothing at all and the dump above has nothing to show.
 # This kills the 50-line progress bar and keeps the findings table.
-run trivy -v "$(pwd):/repo" aquasec/trivy:latest \
+run trivy -v "$(pwd):/repo" "$TRIVY_IMAGE" \
       fs /repo --no-progress --scanners vuln --severity HIGH,CRITICAL \
       --ignore-unfixed --exit-code 1 \
   || die "Trivy found a fixable HIGH/CRITICAL (expected on demo/vulnerable-dependency)"
 ok "0 fixable HIGH/CRITICAL"
 
 # -----------------------------------------------------------------------------
-step "11/12" "Production npm audit"
+step "11/14" "Production npm audit"
 # A second opinion from a different vulnerability database. Trivy and npm audit
 # do not always agree, and the disagreement is itself signal.
 #
@@ -245,7 +283,7 @@ run npm audit --omit=dev --audit-level=high \
 ok "0 high+ in production deps"
 
 # -----------------------------------------------------------------------------
-step "12/12" "Image scan (Trivy, shipped artifact)"
+step "12/14" "Image scan (Trivy, shipped artifact)"
 # NOT redundant with step 10. That one reads package-lock.json; this one reads
 # the final image - app dependencies AND the Alpine OS packages underneath them.
 # The filesystem scan structurally cannot see the base image.
@@ -257,14 +295,42 @@ step "12/12" "Image scan (Trivy, shipped artifact)"
 #
 # Mounting the Docker socket is what lets the scanner read images out of the
 # local daemon. Same severity thresholds as the CI `docker` job.
-run trivy -v //var/run/docker.sock:/var/run/docker.sock aquasec/trivy:latest \
+run trivy -v //var/run/docker.sock:/var/run/docker.sock "$TRIVY_IMAGE" \
       image "$IMAGE" --no-progress --scanners vuln --severity HIGH,CRITICAL \
       --ignore-unfixed --exit-code 1 \
   || die "Trivy found a fixable HIGH/CRITICAL in the shipped image"
 ok "0 fixable HIGH/CRITICAL"
 
 # -----------------------------------------------------------------------------
-printf '\n  %sALL 12 CHECKS PASSED%s   runtime %s · test stage %s\n' \
+step "13/14" "Dockerfile lint (hadolint)"
+# Mirrors the `lint` job in ci.yml. Fails on `warning` and above, matching the
+# workflow's failure-threshold, so a Dockerfile edit that CI would reject gets
+# rejected here first.
+#
+# Currently clean, with exactly one suppression: DL3018 is disabled inline in
+# the Dockerfile because pinning an apk package revision contradicts the
+# `apk upgrade` on the same line. The reasoning lives next to the code it
+# excuses, not in a config file nobody reads.
+run docker run --rm -i "$HADOLINT_IMAGE" hadolint --no-color --failure-threshold warning - < Dockerfile \
+  || die "hadolint found a Dockerfile issue"
+ok "no warnings"
+
+# -----------------------------------------------------------------------------
+step "14/14" "Workflow audit (zizmor)"
+# Mirrors the `lint` job's second step. Audits ci.yml and dependabot.yml for
+# unpinned actions, over-broad permissions, credential persistence and template
+# injection - the security of the pipeline itself, which every other check in
+# this harness takes for granted.
+#
+# `--offline` skips the audits that call the GitHub API. Those need a token and
+# the local run should not require one; CI runs the online audits too.
+run docker run --rm -v "$(pwd):/repo" -w /repo "$ZIZMOR_IMAGE" \
+      --no-progress --persona regular --offline .github/ \
+  || die "zizmor found a workflow issue"
+ok "workflows clean"
+
+# -----------------------------------------------------------------------------
+printf '\n  %sALL 14 CHECKS PASSED%s   runtime %s · test stage %s\n' \
   "$GREEN" "$OFF" \
   "$(docker images "$IMAGE" --format '{{.Size}}')" \
   "$(docker images "$FAT_IMAGE" --format '{{.Size}}')"

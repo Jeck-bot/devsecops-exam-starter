@@ -4,21 +4,31 @@
 #
 #   push / pull_request -> main, plus a nightly schedule
 #            |
-#   +--------+-------------+------------------+-----------------+
-#   v        v             v                  v                 |
-#  test   secret-scan  dependency-scan      codeql              |
-#  (22,24) Gitleaks    Trivy fs + npm audit  JS static analysis |
-#   |                                                           |
-#   +---------------> docker <----------------------------------+
+#   +--------+------------+-----------------+----------+------------+
+#   v        v            v                 v          v            |
+#  test   secret-scan  dependency-scan   codeql      lint           |
+#  (22,24) Gitleaks    Trivy fs +        JS static   hadolint +     |
+#                      npm audit         analysis    zizmor         |
+#   |                                                               |
+#   +---------------> docker <--------------------------------------+
 #                     build --target test
 #                     build runtime
 #                     assert non-root
+#                     assert no devDeps
 #                     smoke-test /health
 #                     Trivy image scan
+#                     SBOM (CycloneDX)
+#
+#   push -> main / schedule only:
+#     scorecard   OpenSSF supply-chain posture - informational, never gates
 #
 # Only `docker` has a dependency (`needs: [test]`). The scanners are independent
 # of it and of each other, so a broken pipeline reports every distinct problem in
 # one run rather than revealing them one push at a time.
+#
+# `lint` audits THIS FILE and the Dockerfile. That is deliberate: every other job
+# scans the application and its dependencies, and none of them would notice if
+# the pipeline itself were the insecure part.
 #
 # ---------------------------------------------------------------------------
 # A note on the SHA pins below.
@@ -370,7 +380,74 @@ jobs:
           category: "/language:javascript-typescript"
 
   # ===========================================================================
-  # 5. DOCKER - spec requirement: "Build the Docker image to ensure the
+  # 5. LINT - audit the pipeline's own artifacts, not the application.
+  #
+  # Every other job in this file scans the app or its dependencies. None of them
+  # would notice if the Dockerfile or this workflow were the insecure part, and
+  # those two files are where most of this project's security decisions actually
+  # live. A repository that scans its code and never scans its build has a blind
+  # spot exactly where the privileged code runs.
+  #
+  # Two tools in one job rather than two jobs: both finish in seconds, and each
+  # extra job is another required status check to wire into branch protection.
+  # ===========================================================================
+  lint:
+    name: Lint (Dockerfile + workflows)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Check out the code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      # hadolint - Dockerfile linter.
+      #
+      # Currently clean. The one rule deliberately suppressed is DL3018
+      # ("pin versions in apk add"), narrowly, on one line, with the reasoning
+      # inline in the Dockerfile: pinning an exact apk revision contradicts the
+      # `apk upgrade` on the same line and breaks the build when Alpine rebuilds
+      # the package.
+      #
+      # Two findings it raised were real and were FIXED rather than suppressed:
+      # DL3025 (shell-form HEALTHCHECK -> exec form, which also matches
+      # docker-compose.yml) and DL3066 (`USER node` -> `USER 1000:1000`, which
+      # an orchestrator can actually verify is non-root).
+      - name: hadolint - Dockerfile
+        uses: hadolint/hadolint-action@06be81baf89a55ffd0e24b8f04a4185738dd3387 # v3.5.0
+        with:
+          dockerfile: Dockerfile
+          # Fail on warnings and above. `info`/`style` findings are advisory.
+          failure-threshold: warning
+
+      # zizmor - static analysis for GitHub Actions, by the ratchet/pip-audit
+      # author. This is the tool that independently checks the claims this
+      # workflow makes about itself: that actions are pinned to immutable SHAs,
+      # that `permissions` is least-privilege, that checkout does not leave a
+      # token in .git/config, and that no `${{ }}` expression is interpolated
+      # into a `run:` block where it could inject shell.
+      #
+      # Arguing in a README that a pipeline is hardened is cheap. Having a
+      # purpose-built auditor agree is not.
+      #
+      # `collect: all` so dependabot.yml is audited too - its `cooldown` settings
+      # came from this audit.
+      - name: zizmor - GitHub Actions workflows
+        uses: zizmorcore/zizmor-action@cc914d7f3750a2d13d75c7f184a1060aa0e9d482 # v0.6.4
+        with:
+          inputs: .github/
+          collect: all
+          # `auditor` is deliberately noisy and `pedantic` reports style; the
+          # default persona reports things that are actually security-relevant.
+          persona: regular
+          # SARIF upload needs security-events: write, which this job does not
+          # have and does not need - findings belong in the job log, where the
+          # person who can fix them is already looking.
+          advanced-security: false
+
+  # ===========================================================================
+  # 6. DOCKER - spec requirement: "Build the Docker image to ensure the
   #    Dockerfile is valid" (plus image scanning and runtime assertions)
   # ===========================================================================
   docker:
@@ -484,6 +561,42 @@ jobs:
           exit-code: "1"
           format: table
 
+      # --- SBOM ---------------------------------------------------------------
+      # A software bill of materials for the artifact that actually ships:
+      # every OS package and npm package inside the final image, in CycloneDX.
+      #
+      # Why bother when Trivy already scans the image two steps up? Because a
+      # scan answers "is anything vulnerable TODAY", against today's advisory
+      # database. An SBOM answers "what is in here", full stop - which is the
+      # question you need when a CVE drops next month and somebody has to
+      # determine, quickly and without a rebuild, whether this image is affected.
+      # Detection is a point-in-time verdict; an inventory keeps its value.
+      #
+      # Generated with the trivy-action already pinned above rather than adding
+      # a separate SBOM action. This workflow argues that every third-party
+      # action is supply-chain surface; pulling in another vendor to emit a file
+      # the existing scanner already produces would undercut that.
+      - name: Generate SBOM (CycloneDX)
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          scan-type: image
+          image-ref: ${{ env.IMAGE_NAME }}:${{ github.sha }}
+          format: cyclonedx
+          output: sbom.cdx.json
+          # An inventory, not a gate. Severity filters would make it a partial
+          # inventory, which is the one thing an SBOM must not be.
+          exit-code: "0"
+          skip-setup-trivy: true
+
+      - name: Upload SBOM
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: sbom-cyclonedx-${{ github.sha }}
+          path: sbom.cdx.json
+          # Long enough to be useful when investigating an incident, short
+          # enough not to accumulate forever on a coursework repo.
+          retention-days: 30
+
       - name: Report image size
         if: always()
         run: |
@@ -494,3 +607,67 @@ jobs:
             echo "|---|---|"
             echo "| \`${IMAGE_NAME}:${GITHUB_SHA}\` | $(docker images "${IMAGE_NAME}:${GITHUB_SHA}" --format '{{.Size}}') |"
           } >> "$GITHUB_STEP_SUMMARY"
+
+  # ===========================================================================
+  # 7. SCORECARD - OpenSSF supply-chain posture, scored by a third party.
+  #
+  # Everything else in this file is a check this repository wrote for itself.
+  # Scorecard is the outside opinion: an OpenSSF-maintained tool that grades a
+  # repository against recognised supply-chain criteria - are actions pinned to
+  # immutable refs, is the token least-privilege, is there branch protection, is
+  # there a security policy, are dependencies kept current, is CI running tests.
+  #
+  # It is the only job here whose verdict was not designed by the same person
+  # who designed the thing being judged, which is precisely what makes it worth
+  # having.
+  #
+  # DELIBERATELY NOT A GATE, and restricted to `main` and the nightly schedule:
+  #
+  #   - Scorecard measures repository SETTINGS (branch protection, policies) as
+  #     much as file contents. Those do not change per-PR, so running it on
+  #     pull requests would score the same posture over and over.
+  #   - Several checks legitimately cannot score full marks here - `Fuzzing`
+  #     and `Signed-Releases` do not apply to a coursework fork with no
+  #     releases, and `Branch-Protection` reads low without a PAT granting admin
+  #     scope, because the default token cannot read protection settings. A gate
+  #     that fails for reasons nobody can act on is the anti-pattern this
+  #     repository argues against everywhere else.
+  #   - Keeping it off pull requests also keeps the two demo PRs honest: they
+  #     are supposed to fail on exactly one thing each.
+  # ===========================================================================
+  scorecard:
+    name: Supply-chain posture (OpenSSF Scorecard)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    if: github.event_name == 'push' || github.event_name == 'schedule'
+
+    permissions:
+      contents: read
+      # Publish the SARIF results to the Security tab.
+      security-events: write
+      # Required to publish results to the public OpenSSF API, which is what
+      # backs the badge. This grants a short-lived OIDC token, not a secret.
+      id-token: write
+
+    steps:
+      - name: Check out the code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Run Scorecard analysis
+        uses: ossf/scorecard-action@2d1146689b8cda280b9bc96326124645441f03bc # v2.4.4
+        with:
+          results_file: scorecard.sarif
+          results_format: sarif
+          # Publishes to the OpenSSF public dataset so the README badge resolves.
+          # Requires a public repository - which this is.
+          publish_results: true
+
+      - name: Upload Scorecard SARIF
+        uses: github/codeql-action/upload-sarif@b96794f015dfd88f77b49b1c93e0fa7110f94c63 # v4
+        if: always()
+        continue-on-error: true
+        with:
+          sarif_file: scorecard.sarif
+          category: scorecard

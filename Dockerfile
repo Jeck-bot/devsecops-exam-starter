@@ -66,20 +66,13 @@ RUN npm test
 ###############################################################################
 FROM node:24-alpine@sha256:50c8e8ca1d27439048670df5883f32d57cf81cff6233222c893fd0d9884cbd81 AS runtime
 
-# tini reaps orphaned child processes and forwards signals.
+# One RUN, two jobs, in the order the command runs them.
 #
-# PID 1 is special: the kernel ignores signals that have no explicit handler
-# installed. Node does not install a SIGTERM handler, so as PID 1 it ignores
-# `docker stop` entirely - Docker waits out the full 10s grace period, then
-# SIGKILLs. With tini at PID 1, node runs as a normal child, the default SIGTERM
-# disposition applies, and the process exits immediately. ~1MB well spent.
+# =============================================================================
+# 1. `apk upgrade` - patch the base image's OS packages at build time.
+# =============================================================================
 #
-# Precisely: this buys PROMPT, signal-correct shutdown - not connection
-# draining. Draining in-flight requests would need `server.close()` inside
-# server.js, and the starter repo forbids modifying it. Fast teardown is the
-# part that is achievable from the container layer, and it is the part that
-# makes deploys quick and `docker stop` honest.
-# `apk upgrade` first, and this line is load-bearing.
+# This line is load-bearing.
 #
 # Digest-pinning the base image buys reproducibility, but it freezes the OS
 # packages at whatever state that digest was published in - so a pinned image is
@@ -109,6 +102,44 @@ FROM node:24-alpine@sha256:50c8e8ca1d27439048670df5883f32d57cf81cff6233222c893fd
 # the digest still pins the base layer, Node version and layout, while this line
 # means "and current security patches on top". Reproducibility exists to make
 # builds trustworthy, not to preserve known-vulnerable libraries.
+#
+# =============================================================================
+# 2. `apk add tini` - a real init process for PID 1.
+# =============================================================================
+#
+# tini reaps orphaned child processes and forwards signals.
+#
+# PID 1 is special: the kernel ignores signals that have no explicit handler
+# installed. Node does not install a SIGTERM handler, so as PID 1 it ignores
+# `docker stop` entirely - Docker waits out the full 10s grace period, then
+# SIGKILLs. With tini at PID 1, node runs as a normal child, the default SIGTERM
+# disposition applies, and the process exits immediately. ~1MB well spent.
+#
+# Precisely: this buys PROMPT, signal-correct shutdown - not connection
+# draining. Draining in-flight requests would need `server.close()` inside
+# server.js, and the starter repo forbids modifying it. Fast teardown is the
+# part that is achievable from the container layer, and it is the part that
+# makes deploys quick and `docker stop` honest.
+#
+# =============================================================================
+# On the suppression below
+# =============================================================================
+#
+# hadolint's DL3018 wants `apk add tini=0.19.0-r3` rather than a bare package
+# name, on the general principle that unpinned installs are not reproducible.
+# That principle is sound and it is the wrong call HERE, for a specific reason:
+# it directly contradicts the `apk upgrade` on the same line.
+#
+# This RUN deliberately takes whatever Alpine currently ships, because the whole
+# argument above is that current security patches beat frozen bytes. Pinning
+# tini to an exact `-rN` package revision would also break the build outright
+# the moment Alpine rebuilds the package, since old revisions are dropped from
+# the repository index.
+#
+# So it is suppressed - narrowly, on one line, with the reasoning attached -
+# rather than silenced globally in a config file. Same standard `.trivyignore`
+# sets for vulnerability findings: an exception has to argue for itself.
+# hadolint ignore=DL3018
 RUN apk upgrade --no-cache && apk add --no-cache tini
 
 # Remove the package managers. A container whose only job is `node server.js`
@@ -179,12 +210,26 @@ COPY --chown=node:node server.js ./
 # `test` stage above, which needs the spec files in the build context in order
 # to have anything to run. One context, three stages, different needs.
 
-# The `node` user (uid 1000) ships with the official image, so there is no
-# need to create one. Everything above this line ran as root; everything from
-# here - including the app - runs unprivileged.
+# The `node` user (uid 1000, gid 1000) ships with the official image, so there
+# is no need to create one. Everything above this line ran as root; everything
+# from here - including the app - runs unprivileged.
 # Required by the exam spec, and it means a container escape starts from an
 # unprivileged account instead of root.
-USER node
+#
+# Written numerically rather than as `USER node`, which is the same account -
+# `id node` in this base image returns uid=1000(node) gid=1000(node).
+#
+# The numeric form is strictly more useful to whatever runs the container.
+# A name only means something to a process that can read /etc/passwd INSIDE the
+# image, so an orchestrator enforcing "must not run as root" cannot evaluate
+# `node` without starting the container first. Kubernetes' `runAsNonRoot` admits
+# exactly this: given a username it cannot verify the UID is non-zero, and
+# refuses to schedule the pod. A number is checkable from the manifest alone.
+# hadolint's DL3066 makes the same point about host-side resolvability.
+#
+# Both halves are given (`1000:1000`) so the primary group is pinned too, rather
+# than inherited from whatever the runtime decides to default to.
+USER 1000:1000
 
 # Documentation only - EXPOSE publishes nothing by itself. The actual mapping
 # is `docker run -p`, which keeps the port a deploy-time decision.
@@ -192,8 +237,15 @@ EXPOSE 3000
 
 # Uses Node 24's built-in global fetch(), so the image needs no curl or wget -
 # two fewer binaries an attacker could use to pull a payload.
+#
+# Exec form (a JSON array), not shell form. Shell form wraps the command in
+# `/bin/sh -c`, which forks an extra process every 30 seconds for the life of
+# the container and puts a shell between Docker and the thing being measured.
+# Exec form runs node directly. It also matches the healthcheck in
+# docker-compose.yml, which was already written this way - the two now express
+# the identical check in the identical syntax. (hadolint DL3025.)
 HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
-  CMD node -e "fetch('http://127.0.0.1:3000/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+  CMD ["node", "-e", "fetch('http://127.0.0.1:3000/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
 
 # ENTRYPOINT + CMD split: tini is always PID 1, but the command stays
 # overridable (`docker run <image> node --version`) for debugging.

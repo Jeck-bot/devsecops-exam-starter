@@ -66,6 +66,21 @@ services:
       - /tmp # ...except anything Node may need to scratch
 
   cache:
+    # Pinned by TAG, not by digest - deliberately, and against the pattern the
+    # Dockerfile sets one directory over.
+    #
+    # The Dockerfile digest-pins because that image ships, and because
+    # Dependabot's `docker` ecosystem keeps the pin fresh. Neither holds here.
+    # That ecosystem matches `/dockerfile|containerfile/i` plus Kubernetes YAML;
+    # it does not read Compose files (checked in dependabot-core, not assumed).
+    # A digest here would therefore be a pin nothing maintains, quietly rotting
+    # until someone happened to look - which is the exact failure the digest was
+    # meant to prevent, just slower and less visible.
+    #
+    # Combined with this being a throwaway cache that exists to satisfy the
+    # "dummy database connected via a Docker network" bonus and never ships, the
+    # tag is the more honest choice. Pin a digest when something keeps it
+    # current; otherwise say why you did not.
     image: redis:7-alpine
     restart: unless-stopped
     # Disable RDB snapshots and the AOF log: this is a throwaway cache, so

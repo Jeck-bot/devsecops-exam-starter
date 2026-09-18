@@ -2,7 +2,7 @@
 
 This repository is coursework — a submission for the LSCS DevSecOps Engineering Challenge. It is not a
 production service and has no users. The policy below is short on purpose, but it is real: a repository
-that runs four security scanners and has nowhere to send a finding is only half a security posture.
+that runs six security scanners and has nowhere to send a finding is only half a security posture.
 
 ## Before you report: the deliberately planted flaws
 
@@ -50,9 +50,18 @@ Out of scope, and deliberately so:
 ## How this repository defends itself
 
 Every push and pull request to `main` runs Gitleaks (secrets), Trivy (dependency and image CVEs),
-`npm audit` (a second advisory database), and CodeQL (static dataflow analysis). A nightly scheduled
-run re-scans `main`'s full history against an updated CVE database, because a dependency that was clean
-at merge time can be critical a week later with no commit in between.
+`npm audit` (a second advisory database), CodeQL (static dataflow analysis), and — because the build is
+privileged code too — hadolint and zizmor against the Dockerfile and the workflows themselves. A nightly
+scheduled run re-scans `main`'s full history against an updated CVE database, because a dependency that
+was clean at merge time can be critical a week later with no commit in between.
+
+Each build also publishes a CycloneDX SBOM of the shipped image as an artefact. A scan tells you what was
+vulnerable on the day it ran; an inventory tells you what is in the image when a CVE is disclosed later,
+which is the question that matters during an incident.
+
+OpenSSF Scorecard runs on `main` and nightly, grading this repository's supply-chain posture against
+criteria nobody here chose. It reports rather than gates — several of its checks do not apply to a
+coursework fork, and a blocking check that cannot be satisfied is worse than no check.
 
 Dependabot has security updates enabled and opens remediation PRs; `.trivyignore` is committed but
 empty, and every future entry must carry a CVE ID, a specific non-exploitability justification, a review
