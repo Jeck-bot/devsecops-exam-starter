@@ -322,11 +322,27 @@ step "14/14" "Workflow audit (zizmor)"
 # injection - the security of the pipeline itself, which every other check in
 # this harness takes for granted.
 #
-# `--offline` skips the audits that call the GitHub API. Those need a token and
-# the local run should not require one; CI runs the online audits too.
+# Runs the ONLINE audits when a GitHub token is available, matching CI exactly.
+#
+# This used to pass `--offline` unconditionally, and that gap shipped a real
+# failure: `ref-version-mismatch` needs the API to resolve a pinned SHA back to
+# its tags, so it cannot fire offline. The local run went green, CI went red,
+# and the harness had once again promised something it was not checking.
+#
+# `gh auth token` is used when present; without it the scan falls back to
+# offline rather than failing, so the harness still works on a machine with no
+# GitHub CLI - it just says so.
+zizmor_args=(--no-progress --persona regular)
+if _tok="$(gh auth token 2>/dev/null)" && [ -n "$_tok" ]; then
+  zizmor_args+=(--gh-token "$_tok")
+else
+  zizmor_args+=(--offline)
+  printf '(offline: no gh token) ' >&2
+fi
 run docker run --rm -v "$(pwd):/repo" -w /repo "$ZIZMOR_IMAGE" \
-      --no-progress --persona regular --offline .github/ \
+      "${zizmor_args[@]}" .github/ \
   || die "zizmor found a workflow issue"
+unset _tok
 ok "workflows clean"
 
 # -----------------------------------------------------------------------------
