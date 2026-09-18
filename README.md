@@ -35,10 +35,10 @@ delivery pipeline. The application code is unchanged; **the pipeline is the deli
 
 ```
  push / pull_request -> main              nightly schedule (02:00 UTC)
-            │                                        │
-  ┌─────────┼──────────────┬───────────┬──────────┐  │
-  ▼         ▼              ▼           ▼          ▼  │
- test    secret-scan  dependency-scan codeql    lint ◄┘  parallel — fail fast
+            │                                          │
+  ┌─────────┼──────────────┬───────────┬──────────┐    │
+  ▼         ▼              ▼           ▼          ▼    │
+ test    secret-scan  dependency-scan codeql     lint ◄┘  parallel — fail fast
  (22,24)  Gitleaks    Trivy fs +      JS static  hadolint
                       npm audit       analysis   + zizmor
   │
